@@ -1,5 +1,7 @@
 # LLM-as-a-Verifier: A General-Purpose Verification Framework
 
+LLM-as-a-Verifier is a general-purpose verification framework that provides fine-grained feedback by scaling scoring granularity, repeated verification, and criteria decompositions. It achieves state-of-the-art performance on Terminal-Bench 2 (86.4%) and SWE-Bench Verified (77.8%) when used as a trajectory reward model for test-time scaling. This repository provides the accompanying code for reproducing the results.
+
 ## Setup
 
 ```bash
@@ -86,10 +88,7 @@ Expected:
 
 ## How it works
 
-**LLM-as-a-Verifier** is a general-purpose verification framework that
-provides fine-grained feedback by scaling scoring granularity, repeated
-verification, and criteria decompositions. Rather than reducing each
-distribution into a single discrete score (as in LLM-as-a-Judge), we approximate the reward of
+Rather than reducing each distribution into a single discrete score (as in LLM-as-a-Judge), **LLM-as-a-Verifier** approximate the reward of
 a trajectory $\tau$ on task $t$ as:
 
 $$
