@@ -120,6 +120,15 @@ benchmark below. Expected results:
 | SWE-Bench Verified | Opus 4.5 / Opus 4.6 / Gemini 3 Flash (Best-of-3) | mini-swe-agent | 76.1% | **78.2%** | 84.4% |
 | MedAgentBench | Claude Opus 4.8 (Best-of-5) | AgentBench | 70.2% | **73.3%** | 75.0% |
 
+### Related web-agent benchmark
+
+For teams evaluating agents on live websites and multi-step browser workflows,
+[ClawBench](https://github.com/TIGER-AI-Lab/ClawBench) provides an independent,
+reproducible benchmark suite with task-level traces and evaluation artifacts.
+It is an external evaluation target and is not included in the result table
+above. See the [project site](https://claw-bench.com/) for the benchmark
+overview and corpus details.
+
 ### Reproduce Results
 
 Run a benchmark by name (`python scripts/run.py` with no argument lists them):
