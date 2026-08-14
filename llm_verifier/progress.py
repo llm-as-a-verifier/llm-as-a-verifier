@@ -1,26 +1,18 @@
 """
 Progress tracking: fine-grained reward over trajectory prefixes.
 
-The same logprob-expectation reward used for best-of-N selection can score a
-trajectory *at every step*: in ONE verifier call we show the task, the full
-trajectory with numbered agent steps, and a list of checkpoints, and ask
-"would the agent's CURRENT state satisfy the task's hidden grader at this
-point?" per checkpoint. Each answer letter (A = 0% progress ... T = 100%) is
-decoded as the expectation over the verifier's top-20 logprobs at the answer
-position, giving a continuous progress curve. On successful trajectories the
-curve rises toward 1; on failing ones it plateaus or falls.
+The verifier is shown the task, the numbered agent steps, and a list of
+checkpoints, and asked per checkpoint whether the agent's CURRENT state would
+already satisfy the task. Each answer letter (A = 0% ... T = 100%) is decoded
+as the expectation over the top-20 logprobs at the answer position, giving a
+continuous progress curve.
 
 Two entry points:
-
-- `llm_verifier.track(problem, steps, ...)` -> `ProgressResult` — offline:
-  scores all checkpoints of a finished trajectory in one verifier call per
-  repeat. The verifier sees the full trajectory while scoring each
-  checkpoint (cheap, but earlier checkpoints could in principle be
-  influenced by the visible ending).
-- `llm_verifier.ProgressTracker(problem, ...)` — online: feed steps as the
-  agent produces them; each `update(step)` scores only the prefix so far,
-  so the verifier structurally cannot see the future. Costs one scoring
-  call per step per repeat.
+- `track(problem, steps, ...)` — offline: scores all checkpoints of a
+  finished trajectory in one verifier call per repeat.
+- `ProgressTracker(problem, ...)` — online: each `update(step)` scores only
+  the prefix so far, so the verifier cannot see the future. One call per
+  step per repeat.
 """
 
 from __future__ import annotations
@@ -37,13 +29,11 @@ from llm_verifier.fine_grained_reward import (
     as_image_list,
     call_verifier,
     create_client,
+    default_max_workers,
 )
 
-# ---------------------------------------------------------------------------
-# Letter scale — A = 0% progress, T = 100% progress.
-# (Note: inverted relative to the pairwise reward scale, where A is best —
-# for progress, later letters mean more progress.)
-# ---------------------------------------------------------------------------
+# Letter scale — A = 0% progress, T = 100% progress (inverted relative to
+# the pairwise reward scale, where A is best).
 
 GRANULARITY = 20
 _LETTERS = list(string.ascii_uppercase[:GRANULARITY])
@@ -250,7 +240,7 @@ def track(
     images: Any = None,
     checkpoint_steps: Optional[Sequence[int]] = None,
     n_evaluations: int = 1,
-    max_workers: int = 8,
+    max_workers: Optional[int] = None,
     model: str = DEFAULT_MODEL,
     client: Any = None,
 ) -> ProgressResult:
@@ -263,17 +253,14 @@ def track(
     Args:
         problem: the task instruction shown to the verifier.
         steps: the agent's steps, one string per step (action + observed
-            output). Truncate very long observations yourself if needed.
-        images: task-context image(s) the verifier sees with every scoring
-            call — a single image or a list, each a local file path
-            (``images="goal.png"``), an http(s) URL, or raw bytes. Requires
-            a multimodal verifier model. For per-step frames, use
-            `ProgressTracker` and pass images to each ``update``.
+            output).
+        images: task-context image(s) attached to every scoring call — one
+            image or a list; each a file path, http(s) URL, or raw bytes.
+            For per-step frames use `ProgressTracker` instead.
         checkpoint_steps: 1-indexed step numbers to score. Defaults to the
-            interior steps ``2 .. T-1`` (the first and last step anchor the
-            scale), or every step for trajectories with fewer than 3 steps.
-        n_evaluations: independent repeats K; the returned curve is their
-            mean.
+            interior steps ``2 .. T-1`` (every step for trajectories with
+            fewer than 3 steps).
+        n_evaluations: independent repeats K; the curve is their mean.
         max_workers: concurrency for the K repeats.
         model: verifier model name.
         client: a pre-built ``openai`` or ``google-genai`` client (optional).
@@ -281,9 +268,6 @@ def track(
     Returns:
         A `ProgressResult` — ``.steps``, ``.scores`` (the progress curve in
         [0, 1]), ``.per_rep_scores``, ``.final``.
-
-    Raises:
-        MissingAPIKeyError: no credentials found and no `client` given.
     """
     t = len(steps)
     if t == 0:
@@ -297,6 +281,8 @@ def track(
             raise ValueError(f"checkpoint_steps out of range 1..{t}: {bad}")
     if n_evaluations < 1:
         raise ValueError("n_evaluations must be >= 1")
+    if max_workers is None:
+        max_workers = default_max_workers()
     if client is None:
         client = create_client()
 
@@ -328,19 +314,13 @@ def track(
 class ProgressTracker:
     """Online progress tracking for a still-running agent.
 
-    Feed steps as the agent produces them; each `update` scores the
-    trajectory prefix accumulated so far, so the verifier structurally
-    cannot be influenced by future steps (unlike offline `track`, which
-    shows the whole trajectory per call). Use it to stop hopeless rollouts
-    early or to decide when to branch/resample.
+    Feed steps as the agent produces them; each `update` scores only the
+    prefix so far, so the verifier cannot be influenced by future steps.
+    Use it to stop hopeless rollouts early or decide when to resample.
+    Cost: one verifier call per repeat per update.
 
-    Cost: one verifier call per repeat per update — a T-step run costs
-    T x n_evaluations calls, versus n_evaluations for offline `track`.
-
-    Pass `images` at construction for task-context image(s) (a goal image,
-    a reference screenshot), and/or per step via `update(step, images=...)`
-    (e.g. a camera frame after each action); both accept a single path /
-    URL / bytes or a list.
+    Pass `images` at construction for task-context image(s), and/or per
+    step via `update(step, images=...)` (e.g. a camera frame per action).
 
     Example:
         tracker = llm_verifier.ProgressTracker(problem, n_evaluations=4)
@@ -349,9 +329,6 @@ class ProgressTracker:
             if tracker.steps[-1] >= 8 and score < 0.05:
                 break                        # abandon early
         result = tracker.result()            # same shape as track()'s
-
-    Raises `MissingAPIKeyError` at construction if no credentials are found
-    and no `client` is given.
     """
 
     def __init__(
@@ -360,7 +337,7 @@ class ProgressTracker:
         *,
         images: Any = None,
         n_evaluations: int = 1,
-        max_workers: int = 8,
+        max_workers: Optional[int] = None,
         model: str = DEFAULT_MODEL,
         client: Any = None,
     ) -> None:
@@ -368,7 +345,8 @@ class ProgressTracker:
             raise ValueError("n_evaluations must be >= 1")
         self.problem = problem
         self.n_evaluations = n_evaluations
-        self.max_workers = max_workers
+        self.max_workers = (max_workers if max_workers is not None
+                            else default_max_workers())
         self.model = model
         self.client = client if client is not None else create_client()
         self.steps: List[int] = []
@@ -383,11 +361,9 @@ class ProgressTracker:
         """Append the agent's latest step and return the progress score of
         the trajectory so far (mean over `n_evaluations` repeats).
 
-        `images` (one image or a list — file paths, http(s) URLs, or raw
-        bytes, e.g. a camera frame after this step) is attached to this
-        step: the step text gets an ``[Image i attached]`` marker and the
-        image stays part of the trajectory for all later updates. Requires
-        a multimodal verifier model."""
+        `images` is attached to this step: the step text gets an
+        ``[Image i attached]`` marker and the image stays part of the
+        trajectory for all later updates."""
         step = str(step)
         step_imgs = as_image_list(images)
         if step_imgs:

@@ -1,34 +1,22 @@
 """
 Probabilistic Pivot Tournament (PPT): O(Nk) best-of-N selection.
 
-A round-robin tournament compares all C(N, 2) pairs of candidates — O(N^2)
-verifier calls per task. PPT reaches the same selection with O(Nk)
-comparisons (k = number of pivots, k << N) in three steps:
+Instead of a full O(N^2) round-robin, PPT selects the best candidate in
+three steps:
 
-  1) Ring pass. Sample a uniformly random Hamiltonian cycle gamma over the N
-     candidates and score the N adjacent directed pairs
-     {(gamma_t, gamma_{t+1 mod N})}. Because the cycle is a single loop, every
-     candidate appears exactly once in the "A" slot and once in the "B" slot of
-     the verifier prompt, so any systematic preference of the verifier for one
-     slot over the other cancels in expectation across the ring.
+  1) Ring pass: score the N adjacent directed pairs of a random Hamiltonian
+     cycle. Every candidate appears once in each prompt slot, so the
+     verifier's slot bias cancels around the ring.
+  2) Pivot selection: the top-k candidates by ring-pass mean preference
+     w_i / c_i become the pivot set P.
+  3) Pivot rounds: score every non-pivot-vs-pivot and pivot-vs-pivot pair,
+     aggregate all comparisons into w_i, c_i, and return argmax_i w_i / c_i.
 
-  2) Pivot selection. Rank candidates by their ring-pass mean preference
-     w_i / c_i and take the top-k as the pivot set P. Pivots are the empirical
-     leaders, so the remaining budget is spent distinguishing the strongest
-     candidates rather than re-scoring weak anchors.
+Total comparisons: N + k(N - k) + C(k, 2) — linear in N for fixed k.
 
-  3) Pivot rounds. With P fixed, score every non-pivot-vs-pivot directed pair
-     (i, p) with i not in P, p in P, and every pivot-vs-pivot pair within P.
-     All ring and pivot-round comparisons are aggregated into the same w_i, c_i
-     and the winner is argmax_i w_i / c_i. Normalizing by c_i removes the bias
-     that pivots take part in more comparisons than non-pivots.
-
-  Total comparisons: N + k(N - k) + C(k, 2), i.e. linear in N for fixed k.
-
-A comparison's two fine-grained rewards (R_a, R_b) become a soft win via the
-Bradley-Terry model, p(a beats b) = sigmoid(R_a - R_b). This module is
-benchmark-agnostic: the caller supplies a directed `score(a, b) -> (R_a, R_b)`
-that scores candidate `a` in slot A and `b` in slot B.
+Each comparison's rewards (R_a, R_b) become a soft win via Bradley-Terry,
+p(a beats b) = sigmoid(R_a - R_b). The caller supplies a directed
+`score(a, b) -> (R_a, R_b)` with `a` in slot A and `b` in slot B.
 """
 
 import math
@@ -38,9 +26,8 @@ DEFAULT_PIVOTS = 2
 
 
 def ring_cycle(n, rng):
-    """Return the N directed adjacent pairs of a uniformly random Hamiltonian
-    cycle over `n` candidates: [(gamma_t, gamma_{t+1 mod N}) for t in range(N)].
-    For n == 1 there are no comparisons."""
+    """The N directed adjacent pairs of a random Hamiltonian cycle over `n`
+    candidates."""
     if n <= 1:
         return []
     perm = list(range(n))
@@ -85,9 +72,9 @@ def pivot_round_pairs(n, pivots):
 
 
 def select_best(n, ring, k, score):
-    """Run the full PPT given a pre-sampled `ring` (list of directed pairs) and
-    a directed `score(a, b) -> (R_a, R_b)`. Returns (best_index, n_comparisons).
-    Use `ring_cycle(n, rng)` to produce `ring`."""
+    """Run the full PPT given a pre-sampled `ring` (from `ring_cycle`) and a
+    directed `score(a, b) -> (R_a, R_b)`. Returns (best_index,
+    n_comparisons)."""
     w = [0.0] * n
     c = [0] * n
 

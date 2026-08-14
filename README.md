@@ -13,7 +13,7 @@ Any modality, Many Applications, One Unified Verification Framework
 | <a href="https://llm-as-a-verifier.com/docs/"><b>Documentation</b></a> | <a href="https://llm-as-a-verifier.com"><b> Website</b></a> | <a href="https://arxiv.org/abs/2607.05391"><b>Paper</b></a> | <a href="https://github.com/llm-as-a-verifier/TurboAgent"><b>Claude Code Plugin</b></a> | <a href="https://x.com/jackyk02/status/2042347578139033628"><b>Twitter/X</b></a> | <a href="https://join.slack.com/t/llm-as-a-verifier/shared_invite/zt-3utx6oe8m-86ACBqtPGfsOnpOoMJQwng"><b>Slack</b></a> |
 </p>
 
-🔥 LLM-as-a-Verifier achieves SOTA performance across agentic benchmarks, including Terminal-Bench V2, SWE-Bench Verified, MedAgentBench, RoboRewardBench and more. We invite the community to contribute more use cases!
+🔥 LLM-as-a-Verifier achieves SOTA performance across agentic benchmarks, including Terminal-Bench, SWE-Bench Verified, MedAgentBench, RoboRewardBench and more. We invite the community to contribute more use cases!
 
 
 ---
@@ -29,6 +29,14 @@ To install the latest from a clone:
 ```bash
 pip install -e .
 ```
+
+**What's new in 0.2.0** (full notes in [CHANGELOG.md](CHANGELOG.md)):
+
+- `deepseek-v4-flash` verifier backend
+- Prefix-cache optimization: ~3.4× fewer uncached input tokens on
+  trajectory-heavy benchmarks
+- Token accounting (`llm_verifier.token_usage()`)
+- Terminal-Bench 2.1 [self-verification benchmark](#self-verification-terminal-bench-21)
 
 ---
 
@@ -51,11 +59,9 @@ tracking, and reinforcement learning.
 
 ### Simple Best-of-N Selection
 
-Run a first end-to-end selection (requires
-`VERTEX_API_KEY` in `.env`, or an OpenAI-compatible server that returns
+Run a first end-to-end selection (requires `DEEPSEEK_API_KEY` or `VERTEX_API_KEY` in `.env`, or an OpenAI-compatible server that returns
 logprobs — e.g. `vllm serve Qwen/Qwen3.5-9B` with
-`OPENAI_BASE_URL=http://localhost:8000/v1`; the served model is
-auto-detected):
+`OPENAI_BASE_URL=http://localhost:8000/v1`):
 
 ```python
 import llm_verifier
@@ -108,11 +114,34 @@ print(result.scores)  # progress after each step: [0.00106, 0.02417, 0.03143, 0.
 
 ---
 
+## Self-Verification (Terminal Bench 2.1)
+
+Can a model verify its own rollouts? On Terminal-Bench 2.1 we generate 5
+mini-swe-agent trajectories per task with `deepseek-v4-flash` and use the
+**same model** as the verifier. Selection lands well above Pass@1 even though
+the verifier is judging its own model's work:
+
+| Config | Pass@1 | LLM-as-a-Verifier | Oracle |
+|---|---|---|---|
+| Best-of-3 | 79.4% | **85.4%** | 92.1% |
+| Best-of-5 | 78.7% | **88.8%** | 96.6% |
+
+The trajectories ship in `data/terminal_bench_2.1_trajs/`; scoring only needs
+`DEEPSEEK_API_KEY` in `.env`. Each configuration has its own reproduction
+script:
+
+```bash
+python scripts/run_bo3.py                    # best-of-3
+python scripts/run_bo5.py                    # best-of-5
+```
+
+---
+
 ## Test-Time Scaling for Agentic Benchmarks
 
 Each benchmark ships with its agent trajectories (`data/`). We use Gemini 2.5
-Flash (`gemini-2.5-flash`, the default model) as the verifier for all
-benchmark below. Expected results:
+Flash (`gemini-2.5-flash`) as the verifier for all benchmarks below. Expected
+results:
 
 | Benchmark | Base Model | Harness | Pass@1 | LLM-as-a-Verifier | Oracle |
 |---|---|---|---|---|---|
@@ -283,25 +312,28 @@ configuration and setup details.
 .
 ├── scripts/                     # command-line entry points
 │   ├── run.py                   #   registry-driven benchmark launcher
+│   ├── run_bo3.py               #   reproduce the best-of-3 self-verification run
+│   ├── run_bo5.py               #   reproduce the best-of-5 self-verification run
 │   └── terminal_bench_progress.py  # re-score + plot the progress-tracking example
 ├── criteria/                    # verifier criteria + ground-truth notes
 │   ├── TEMPLATE.md              #   copy this to write your own
 │   ├── terminal_bench.md
 │   ├── swe_bench.md
 │   └── medagentbench.md
-├── llm_verifier/                  # the reusable framework (import llm_verifier)
+├── llm_verifier/                # the reusable framework (import llm_verifier)
 │   ├── __init__.py              #   llm_verifier.select(...) / .compare(...)
 │   ├── __main__.py              #   python -m llm_verifier <file.md>: preview criteria
 │   ├── benchmarks.py            #   BENCHMARKS registry (one Benchmark / launch)
-│   ├── fine_grained_reward.py   #   R(x,τ): Gemini logprob scoring + cache
+│   ├── fine_grained_reward.py   #   R(x,τ): logprob scoring + score cache
 │   ├── progress.py              #   llm_verifier.track(...): per-step progress curve
 │   ├── pivot_tournament.py      #   PPT: O(Nk) selection (Bradley-Terry)
 │   ├── prompts.py               #   load criteria/*.md + normalize criteria args
 │   └── loaders.py               #   per-benchmark trajectory loaders
-├── data/                        # agent trajectories per benchmark
-├── cache/                       # verifier score caches (written per run)
-└── results/                     # result tables (written after each run)
+└── data/                        # agent trajectories per benchmark
 ```
+
+Runs write their verifier score caches to `cache/` and result tables to
+`results/`; both are created on demand and git-ignored.
 
 ---
 
@@ -350,7 +382,8 @@ $\mathcal{O}(Nk)$.
    is scored via the pairwise preference
    $p(a \succ b) = \sigma(R_a - R_b)$, concentrating the budget on uncertain
    top candidates and cutting cost from $\mathcal{O}(N^2)$ to
-   $\mathcal{O}(Nk)$.
+   $\mathcal{O}(Nk)$. Repeated evaluations of a pair alternate the A/B
+   prompt slots, so positional bias cancels here as well.
 5. **Selection:** comparisons are aggregated into win mass $w_i$ and count
    $c_i$, and the candidate with the highest normalized $w_i/c_i$ is
    returned.
@@ -402,6 +435,56 @@ Rating Rules: Rate completion on a 1-20 scale (1 = certainly not complete,
 
 > Note: we use a letter-based scale (A-T) instead of digits in the actual
 > implementation to enable logprob extraction for granularity scaling.
+
+---
+
+## Prefix-Cache Optimization
+
+Each verification prompt carries two full trajectories (~80k tokens on
+Terminal-Bench 2.1) and is re-scored per criterion and repeat, so on a backend
+that caches prompt prefixes almost all of that input can be reused. Two things
+make it happen: the prompt keeps the criterion at the *tail*, so everything
+before it (task, both trajectories, rating scale) is a shared prefix, and
+scoring warms one request per distinct prefix to completion before fanning out
+the rest. Together these take the cache hit rate from 5.2% to 78.4% on
+`terminal_bench_2.1`, cutting uncached input tokens by ~3.4×.
+
+### Token Accounting
+
+Every verifier call records what it was billed for, so the cache hit rate above
+is measured rather than assumed. `scripts/run.py` prints the totals under the
+result table (and writes them to `results/<benchmark>.txt`):
+
+```
+Verifier tokens (4,320 verifier calls)
+  input                          272,551,552
+    cached input                 214,712,320  (78.8% hit rate)
+    uncached input                57,839,232
+  output                          32,441,600
+    reasoning                     26,102,144
+```
+
+Only calls this run actually made are counted — comparisons served from the
+score cache add nothing. Reasoning tokens are a subset of output tokens, and
+cached input is a subset of input. The counter is process-wide and
+thread-safe, so library users get the same numbers out of `select` /
+`compare` / `track`:
+
+```python
+import llm_verifier
+
+llm_verifier.USAGE.reset()
+result = llm_verifier.select(problem, trajectories, criteria="terminal_bench")
+print(llm_verifier.token_usage())
+# {'calls': 24, 'input_tokens': 1512480, 'cached_input_tokens': 1190208,
+#  'uncached_input_tokens': 322272, 'output_tokens': 180224,
+#  'reasoning_tokens': 145408, 'cache_hit_rate': 0.787}
+```
+
+`llm_verifier.USAGE` is a `TokenUsage`: `.snapshot()` for the dict above,
+`.reset()` to zero it, and `format_usage(...)` for the report block. Counts
+come from the backend's own usage block; a backend that reports no usage
+simply contributes zeros.
 
 ## Citation
 

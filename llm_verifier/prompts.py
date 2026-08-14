@@ -1,8 +1,7 @@
 """
-Load verifier criteria + ground-truth note from a benchmark prompt file.
+Load verifier criteria + ground-truth note from a criteria file.
 
-Prompt files live in criteria/<benchmark>.md at the repository root so they
-are easy to read and edit without touching code. Expected layout:
+Criteria files live in criteria/<benchmark>.md. Expected layout:
 
     # <title>
 
@@ -14,18 +13,11 @@ are easy to read and edit without touching code. Expected layout:
 
     ### <Criterion Name>
 
-    <criterion description, any number of paragraphs>
+    <criterion description>
 
-    ### <Criterion Name>
-
-    ...
-
-The section headings ("Ground Truth Note", "Criteria") are matched
-case-insensitively. Each `### Criterion Name` heading is the criterion's
-display name; its id (used as the score-cache key and to reference the
-criterion from the benchmark registry) is slugged from the name. Pin an
-explicit id with a trailing Markdown attribute — `### Criterion Name {#id}` —
-when you need the id to stay stable while editing the name.
+Each `### Criterion Name` heading is the display name; its id (the
+score-cache key) is slugged from the name, or pinned explicitly with
+`### Criterion Name {#id}`.
 """
 
 import os
@@ -64,13 +56,8 @@ def _criteria_dirs():
 
 
 def _read_criteria(path):
-    """Resolve a criteria argument to its file contents.
-
-    Accepts either an existing filesystem path (your own ``my_criteria.md``,
-    or an absolute path) or a bare benchmark name (``"swe_bench"``) that maps
-    to ``criteria/<name>.md`` in the repository root (or the working
-    directory).
-    """
+    """Resolve a criteria argument — a filesystem path or a bare benchmark
+    name mapping to ``criteria/<name>.md`` — to its file contents."""
     if os.path.isfile(path):
         with open(path) as f:
             return f.read()
@@ -92,12 +79,9 @@ def _read_criteria(path):
 
 def load_prompts(path):
     """Return (ground_truth_note, criteria) where criteria is a list of
-    {"id", "name", "description"} dicts in file order.
-
-    ``path`` may be a filesystem path or a bundled benchmark name (see
-    :func:`_read_criteria`). HTML comments (``<!-- ... -->``) are stripped, so
-    criteria files can carry author notes the verifier never sees. Raises
-    ``ValueError`` with a format hint if no criteria can be parsed."""
+    {"id", "name", "description"} dicts in file order. HTML comments are
+    stripped, so criteria files can carry author notes the verifier never
+    sees. Raises ``ValueError`` if no criteria can be parsed."""
     text = _HTML_COMMENT.sub("", _read_criteria(path))
     lines = text.splitlines()
 

@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """Re-score and plot the SUCCESS-vs-FAILED progress-tracking example.
 
-Runs `llm_verifier.track()` (K=16 repeats) on the two Terminus 2 runs of the
-Terminal-Bench 2 task `pytorch-model-cli` shipped in
-`data/progress_tracking/pytorch-model-cli/`, saves the curves JSON, and renders
-the figure (steps normalized to [0, 1], scores normalized by the global max of
-the two mean curves, ±1 std band over the repeats). Scoring makes real
-verifier calls — requires `VERTEX_API_KEY` in `.env`.
+Runs `llm_verifier.track()` (K=16) on the two Terminus 2 runs of the
+Terminal-Bench task `pytorch-model-cli` in `data/progress_tracking/`, then
+renders the figure. Scoring makes real verifier calls — requires a verifier
+backend in `.env`.
 
 Usage:
     python scripts/terminal_bench_progress.py                # re-score + plot
-    python scripts/terminal_bench_progress.py --plot-only    # replot previously-scored curves (no key)
-    python scripts/terminal_bench_progress.py --online       # replay both runs step-by-step
-                                                     # through ProgressTracker (K=4)
+    python scripts/terminal_bench_progress.py --plot-only    # replot saved curves
+    python scripts/terminal_bench_progress.py --online       # replay step-by-step
+                                                             # via ProgressTracker
 
 Writes `cache/progress_pytorch-model-cli_k16.json` and `progress_traces.png`.
 """

@@ -1,10 +1,8 @@
 """LLM-as-a-Verifier: fine-grained reward + pivot tournament selection.
 
-The high-level entry points are `select` (pick the best of N agent
-trajectories via a Probabilistic Pivot Tournament), `compare` (raw
-fine-grained rewards for one pairwise comparison), and `track` (progress
-curve over a single trajectory's steps). For batch / benchmark runs use the
-config-driven launcher in `run.py` instead.
+Entry points: `select` (best of N trajectories), `compare` (raw pairwise
+rewards), and `track` / `ProgressTracker` (per-step progress). For benchmark
+runs use `scripts/run.py`.
 """
 
 from __future__ import annotations
@@ -20,16 +18,23 @@ from llm_verifier import pivot_tournament as ppt
 from llm_verifier.fine_grained_reward import (
     DEFAULT_MODEL,
     GRANULARITY,
+    USAGE,
     LazyClient,
     MissingAPIKeyError,
+    TokenUsage,
     create_client,
+    default_max_workers,
     directed_reward,
+    format_usage,
     load_dotenv,
     score_directed_pairs,
     score_pair_criterion,
+    token_usage,
 )
 from llm_verifier.progress import ProgressResult, ProgressTracker, track
 from llm_verifier.prompts import load_prompts, normalize_criteria
+
+__version__ = "0.2.0"
 
 __all__ = [
     "select",
@@ -42,6 +47,10 @@ __all__ = [
     "GRANULARITY",
     "DEFAULT_MODEL",
     "load_dotenv",
+    "USAGE",
+    "TokenUsage",
+    "token_usage",
+    "format_usage",
 ]
 
 # A criteria argument: bundled benchmark name or criteria-file path (str),
@@ -111,10 +120,10 @@ def select(
     criteria: CriteriaArg,
     images: Optional[ImagesArg] = None,
     ground_truth_note: Optional[str] = None,
-    n_evaluations: int = 8,
+    n_evaluations: int = 4,
     pivots: int = 2,
     seed: int = 0,
-    max_workers: int = 50,
+    max_workers: Optional[int] = None,
     model: str = DEFAULT_MODEL,
     cache: Optional[str] = None,
     progress: Optional[bool] = None,
@@ -123,11 +132,10 @@ def select(
 ) -> VerifierResult:
     """Select the best of N agent trajectories for a single task.
 
-    Scores directed pairs of trajectories with the fine-grained Gemini reward
-    and aggregates them with a Probabilistic Pivot Tournament (PPT), so the
-    cost is O(Nk) verifier comparisons rather than the O(N²) of a full
-    round-robin. Identical inputs with the same `seed` run the identical
-    tournament.
+    Scores directed pairs with the fine-grained reward and aggregates them
+    with a Probabilistic Pivot Tournament — O(Nk) verifier comparisons
+    instead of a full O(N²) round-robin. Identical inputs with the same
+    `seed` run the identical tournament.
 
     Args:
         problem: the task description shown to the verifier.
@@ -136,29 +144,26 @@ def select(
             ``*.md`` criteria file, a ``{name: description}`` dict, or a list
             of strings / ``{"id", "name", "description"}`` dicts.
         images: task-context image(s) the verifier sees with every comparison
-            — a single image or a list, each a local file path
-            (``images="frame.png"``), an http(s) URL, or raw bytes. Requires
-            a multimodal verifier model.
-        ground_truth_note: optional note the verifier always sees; defaults to
-            the note parsed from the prompt file (or empty).
+            — one image or a list; each a file path, http(s) URL, or raw
+            bytes. Requires a multimodal verifier model.
+        ground_truth_note: optional note the verifier always sees; defaults
+            to the note parsed from the prompt file (or empty).
         n_evaluations: repeated verifications K per criterion.
-        pivots: number of pivots k in the tournament. Keep k small relative
-            to len(trajectories) — cost grows as O(Nk), and k ≥ N degenerates
-            to a full round-robin (k is clamped to N).
+        pivots: number of pivots k. Cost grows as O(Nk); k is clamped to N.
         seed: seed for the random ring pass.
-        max_workers: concurrency for verifier calls.
+        max_workers: concurrency for verifier calls (default: 500 on
+            DeepSeek, 50 otherwise).
         model: verifier model name (default ``gemini-2.5-flash``).
-        cache: optional path to a JSON score cache. Re-running with the same
-            cache re-scores only the comparisons not seen before.
-        progress: show a progress bar / log lines. Default (``None``) shows
-            progress only when stderr is a TTY.
-        on_error: ``"tie"`` scores a failed verifier call 0.5/0.5 for this run
-            (never persisted to the cache); ``"raise"`` re-raises it.
-        client: a pre-built ``openai`` or ``google-genai`` client (optional);
-            by default an OpenAI-compatible client is created when
-            ``OPENAI_BASE_URL`` is set (vLLM / SGLang / OpenAI), otherwise a
-            Gemini client from ``VERTEX_API_KEY``. Either way the backend
-            must expose token-level logprobs.
+        cache: optional JSON score-cache path; re-runs only score
+            comparisons not seen before.
+        progress: show a progress bar. Default (``None``): only when stderr
+            is a TTY.
+        on_error: ``"tie"`` scores a failed verifier call 0.5/0.5 for this
+            run (never persisted to the cache); ``"raise"`` re-raises it.
+        client: a pre-built ``openai`` or ``google-genai`` client; by default
+            one is built from the environment (``OPENAI_BASE_URL``, then
+            ``DEEPSEEK_API_KEY``, then ``VERTEX_API_KEY``). The backend must
+            expose token-level logprobs.
 
     Returns:
         A `VerifierResult` whose ``.index`` / ``.best`` is the chosen
@@ -171,6 +176,8 @@ def select(
     note, crits = _resolve_criteria(criteria, ground_truth_note)
     criteria_ids = [c["id"] for c in crits]
     show_progress = _default_progress(progress)
+    if max_workers is None:
+        max_workers = default_max_workers()
 
     n = len(candidates)
     if n == 0:
@@ -233,28 +240,24 @@ def compare(
     images: Optional[ImagesArg] = None,
     ground_truth_note: Optional[str] = None,
     n_evaluations: int = 1,
-    max_workers: int = 8,
+    max_workers: Optional[int] = None,
     model: str = DEFAULT_MODEL,
     client: Any = None,
 ) -> Tuple[float, float]:
     """Fine-grained rewards (R_A, R_B) in [0, 1] for one directed comparison.
 
-    The verifier sees `trace_a` in slot A and `trace_b` in slot B; rewards are
-    averaged over all criteria and `n_evaluations` repeats. This is the raw
-    pairwise reward `select` is built on — note the single directed call does
-    not cancel slot bias the way `select`'s ring pass does.
-
-    `criteria` and `images` accept the same forms as `select` (`images` is
-    one image or a list — file paths, http(s) URLs, or raw bytes — attached
-    as task context; requires a multimodal verifier model). A failed
-    verifier call raises (there is no tie fallback here).
-
-    Raises:
-        MissingAPIKeyError: no credentials found and no `client` given.
+    The verifier sees `trace_a` in slot A and `trace_b` in slot B; rewards
+    are averaged over all criteria and `n_evaluations` repeats. This is the
+    raw pairwise reward `select` is built on — a single directed call does
+    not cancel slot bias the way `select`'s ring pass does. `criteria` and
+    `images` accept the same forms as `select`; a failed verifier call
+    raises.
     """
     if n_evaluations < 1:
         raise ValueError("n_evaluations must be >= 1")
     note, crits = _resolve_criteria(criteria, ground_truth_note)
+    if max_workers is None:
+        max_workers = default_max_workers()
     if client is None:
         client = create_client()
 

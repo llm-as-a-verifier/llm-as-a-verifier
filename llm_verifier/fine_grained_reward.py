@@ -1,22 +1,18 @@
 """
 Fine-grained reward model.
 
-Rather than collapsing a verifier's judgement into one discrete label (as in
-LLM-as-a-Judge), LLM-as-a-Verifier reads the model's probability distribution
-over an ordered set of score tokens and takes its expectation. The reward of a
-trajectory tau on task t is
+Instead of collapsing the verifier's judgement into one discrete label (as in
+LLM-as-a-Judge), read its probability distribution over an ordered set of
+score tokens and take the expectation:
 
     R(t, tau) = (1 / C K) * sum_c sum_k sum_g  p_theta(v_g | t, c, tau) * phi(v_g)
 
-  C  = number of evaluation criteria
-  K  = number of repeated verifications
-  G  = number of ordered score tokens (granularity)
-  v_g = the g-th score token,  phi(v_g) = its scalar value
-  p_theta = probability the verifier assigns to token v_g (from logprobs)
+with C criteria, K repeated verifications, and G score tokens (granularity);
+phi maps each score token to its scalar value.
 
-This module provides the granularity-20 scale, the Gemini logprob client, the
-score-token expectation `extract_score`, the pairwise prompt, and a cached
-batch scorer that only scores the pairs a pivot tournament actually needs.
+Provides the granularity-20 scale, the verifier clients (DeepSeek / Gemini /
+any OpenAI-compatible server with logprobs), the score expectation
+`extract_score`, the pairwise prompt, and a cached batch scorer.
 """
 
 import base64
@@ -24,19 +20,45 @@ import json
 import math
 import os
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DEFAULT_MODEL = "gemini-2.5-flash"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+
+DEFAULT_MAX_WORKERS = 50
+DEEPSEEK_MAX_WORKERS = 500
+
+# DeepSeek reasoning settings. The reasoning trace shares the output budget
+# with the answer, so the budget must cover both — too small and the call is
+# cut off before the score tags. "high" effort with a 32k budget matched
+# "max" accuracy on Terminal-Bench 2.1 at ~17% fewer output tokens.
+DEEPSEEK_THINKING = {"type": "enabled"}
+DEEPSEEK_REASONING_EFFORT = "high"
+DEEPSEEK_MAX_TOKENS = 32768
+
+
+def deepseek_reasoning_params():
+    """(extra_body, max_tokens) for a DeepSeek call. ``DEEPSEEK_EFFORT``
+    (``off`` / ``low`` / ``high`` / ``max``) and ``DEEPSEEK_MAX_TOKENS`` in
+    the environment override the module defaults."""
+    load_dotenv()
+    effort = os.environ.get("DEEPSEEK_EFFORT", DEEPSEEK_REASONING_EFFORT)
+    max_tokens = int(os.environ.get("DEEPSEEK_MAX_TOKENS",
+                                    DEEPSEEK_MAX_TOKENS))
+    if effort in ("off", "disabled", "none"):
+        return {"thinking": {"type": "disabled"}}, max_tokens
+    return ({"thinking": DEEPSEEK_THINKING, "reasoning_effort": effort},
+            max_tokens)
 
 
 class MissingAPIKeyError(RuntimeError):
     """No verifier backend found in the environment.
 
-    Set ``OPENAI_BASE_URL`` to use an OpenAI-compatible server (e.g. vLLM or
-    SGLang), or ``VERTEX_API_KEY`` to use Gemini via Vertex AI (in the
-    environment or a ``.env`` file in the working directory), or pass a
-    pre-built client via the ``client=`` argument. Either way the backend
-    must expose token-level logprobs, which the fine-grained reward needs.
+    Set ``OPENAI_BASE_URL`` (OpenAI-compatible server), ``DEEPSEEK_API_KEY``
+    (DeepSeek), or ``VERTEX_API_KEY`` (Gemini via Vertex AI) — in the
+    environment or a ``.env`` file — or pass a pre-built ``client=``. The
+    backend must expose token-level logprobs.
     """
 
 
@@ -84,11 +106,8 @@ def load_dotenv(root_dir=None):
 
 
 def create_gemini_client():
-    """Build a ``google-genai`` client from ``VERTEX_API_KEY`` (a ``.env``
-    file in the working directory is loaded first). Only Vertex AI is
-    supported — extracting the score-token logprob distribution requires the
-    token-level logprobs the Vertex API exposes. Raises `MissingAPIKeyError`
-    if the key is not set."""
+    """Build a ``google-genai`` client from ``VERTEX_API_KEY``. Vertex AI
+    only — the plain Gemini API does not expose token-level logprobs."""
     from google import genai
     load_dotenv()
     vertex_key = os.environ.get("VERTEX_API_KEY")
@@ -105,36 +124,217 @@ def create_gemini_client():
 
 def create_openai_client(base_url=None, api_key=None):
     """Build an ``openai`` client for any OpenAI-compatible server that
-    returns token-level logprobs (vLLM ``vllm serve``, SGLang, OpenAI).
-    ``base_url`` defaults to ``OPENAI_BASE_URL`` (e.g.
-    ``http://localhost:8000/v1`` for a local vLLM server) and ``api_key`` to
-    ``OPENAI_API_KEY`` (any string works for a local vLLM server)."""
+    returns token-level logprobs (vLLM, SGLang, OpenAI, DeepSeek).
+    ``base_url`` defaults to ``OPENAI_BASE_URL``, ``api_key`` to
+    ``OPENAI_API_KEY`` then ``DEEPSEEK_API_KEY``. A DeepSeek ``base_url``
+    gets the DeepSeek call path."""
     from openai import OpenAI
     load_dotenv()
     base_url = base_url or os.environ.get("OPENAI_BASE_URL")
     if not base_url:
         raise MissingAPIKeyError(
             "set OPENAI_BASE_URL to an OpenAI-compatible endpoint "
-            "(e.g. http://localhost:8000/v1 for vLLM)")
-    return OpenAI(base_url=base_url,
-                  api_key=api_key or os.environ.get("OPENAI_API_KEY", "EMPTY"))
+            "(e.g. http://localhost:8000/v1 for vLLM, or "
+            "https://api.deepseek.com for DeepSeek)")
+    client = OpenAI(
+        base_url=base_url,
+        api_key=api_key or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("DEEPSEEK_API_KEY", "EMPTY"))
+    if "api.deepseek.com" in base_url:
+        client._llm_verifier_model = DEEPSEEK_MODEL
+        client._llm_verifier_deepseek = True
+    return client
+
+
+def create_deepseek_client(api_key=None, model=DEEPSEEK_MODEL):
+    """Build an ``openai`` client for DeepSeek's hosted API from
+    ``DEEPSEEK_API_KEY``. The client is tagged so scoring reads the
+    distribution from DeepSeek's own sampled score tags instead of the
+    vLLM-only prefill trick."""
+    from openai import OpenAI
+    load_dotenv()
+    key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+    if not key:
+        raise MissingAPIKeyError(
+            "set DEEPSEEK_API_KEY in .env or environment to use DeepSeek "
+            "as the verifier")
+    client = OpenAI(api_key=key, base_url="https://api.deepseek.com")
+    client._llm_verifier_model = model
+    client._llm_verifier_deepseek = True
+    return client
 
 
 def create_client():
-    """Build a verifier client from the environment: an OpenAI-compatible
-    client when ``OPENAI_BASE_URL`` is set (vLLM / SGLang / OpenAI),
-    otherwise a Gemini client from ``VERTEX_API_KEY``. Raises
-    `MissingAPIKeyError` when neither is configured."""
+    """Build a verifier client from the environment: ``OPENAI_BASE_URL``,
+    then ``DEEPSEEK_API_KEY``, then ``VERTEX_API_KEY``. Raises
+    `MissingAPIKeyError` when none is configured."""
     load_dotenv()
     if os.environ.get("OPENAI_BASE_URL"):
         return create_openai_client()
+    if os.environ.get("DEEPSEEK_API_KEY"):
+        return create_deepseek_client()
     return create_gemini_client()
+
+
+def default_max_workers():
+    """Default verifier-call concurrency: 500 on DeepSeek (no concurrency
+    rate limit), 50 otherwise."""
+    load_dotenv()
+    base_url = os.environ.get("OPENAI_BASE_URL", "")
+    if "api.deepseek.com" in base_url or (
+            not base_url and os.environ.get("DEEPSEEK_API_KEY")):
+        return DEEPSEEK_MAX_WORKERS
+    return DEFAULT_MAX_WORKERS
 
 
 def _is_openai_client(client):
     """OpenAI clients expose `.chat.completions`; google-genai clients
     don't have `.chat`."""
     return hasattr(client, "chat")
+
+
+# ---------------------------------------------------------------------------
+# Token accounting — every verifier call records what it was billed for in
+# the process-wide `USAGE` counter (input, cached-input share, output).
+# ---------------------------------------------------------------------------
+
+def _int(value):
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _usage_from_response(response):
+    """(input, cached_input, output, reasoning) tokens for one verifier
+    response. Handles the OpenAI-compatible shape (``usage``) and the
+    google-genai shape (``usage_metadata``); unreported fields count as 0."""
+    usage = getattr(response, "usage", None)
+    if usage is not None:  # OpenAI-compatible (vLLM, SGLang, OpenAI, DeepSeek)
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        cached = _int(getattr(prompt_details, "cached_tokens", 0))
+        if not cached:
+            cached = _int(getattr(usage, "prompt_cache_hit_tokens", 0))
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        return (_int(getattr(usage, "prompt_tokens", 0)),
+                cached,
+                _int(getattr(usage, "completion_tokens", 0)),
+                _int(getattr(completion_details, "reasoning_tokens", 0)))
+
+    meta = getattr(response, "usage_metadata", None)
+    if meta is not None:  # google-genai
+        # Gemini reports the reasoning trace separately from the answer; both
+        # are billed as output.
+        thoughts = _int(getattr(meta, "thoughts_token_count", 0))
+        return (_int(getattr(meta, "prompt_token_count", 0)),
+                _int(getattr(meta, "cached_content_token_count", 0)),
+                _int(getattr(meta, "candidates_token_count", 0)) + thoughts,
+                thoughts)
+
+    return 0, 0, 0, 0
+
+
+class TokenUsage:
+    """Thread-safe running total of verifier token usage.
+
+    Attributes (all cumulative since the last `reset`):
+        calls:          verifier requests that reported usage.
+        input_tokens:   prompt tokens billed, cached and uncached together.
+        cached_input_tokens: the prefix-cache-hit share of `input_tokens`.
+        output_tokens:  completion tokens, reasoning trace included.
+        reasoning_tokens: the reasoning-trace share of `output_tokens`.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        """Zero every counter (e.g. between phases of a run)."""
+        with self._lock:
+            self.calls = 0
+            self.input_tokens = 0
+            self.cached_input_tokens = 0
+            self.output_tokens = 0
+            self.reasoning_tokens = 0
+
+    def add(self, input_tokens=0, cached_input_tokens=0, output_tokens=0,
+            reasoning_tokens=0, calls=1):
+        with self._lock:
+            self.calls += calls
+            self.input_tokens += input_tokens
+            self.cached_input_tokens += cached_input_tokens
+            self.output_tokens += output_tokens
+            self.reasoning_tokens += reasoning_tokens
+
+    def record(self, response):
+        """Add one backend response's usage. Safe to call from worker
+        threads, and a no-op for a response that carries no usage block."""
+        inp, cached, out, reasoning = _usage_from_response(response)
+        if inp or cached or out:
+            self.add(inp, cached, out, reasoning)
+        return inp, cached, out, reasoning
+
+    def snapshot(self):
+        """The current counters as a plain dict, plus the derived
+        `cache_hit_rate` (cached input / input) and `uncached_input_tokens`."""
+        with self._lock:
+            inp, cached = self.input_tokens, self.cached_input_tokens
+            return {
+                "calls": self.calls,
+                "input_tokens": inp,
+                "cached_input_tokens": cached,
+                "uncached_input_tokens": inp - cached,
+                "output_tokens": self.output_tokens,
+                "reasoning_tokens": self.reasoning_tokens,
+                "cache_hit_rate": (cached / inp) if inp else 0.0,
+            }
+
+    def __sub__(self, other):
+        """`after - before` — the usage accumulated between two snapshots,
+        as a `TokenUsage`, so a phase can be reported without resetting."""
+        delta = TokenUsage()
+        delta.add(self.input_tokens - other.input_tokens,
+                  self.cached_input_tokens - other.cached_input_tokens,
+                  self.output_tokens - other.output_tokens,
+                  self.reasoning_tokens - other.reasoning_tokens,
+                  calls=self.calls - other.calls)
+        return delta
+
+    def copy(self):
+        c = TokenUsage()
+        c.add(self.input_tokens, self.cached_input_tokens, self.output_tokens,
+              self.reasoning_tokens, calls=self.calls)
+        return c
+
+    def __str__(self):
+        s = self.snapshot()
+        return (f"{s['calls']:,} calls  "
+                f"input {s['input_tokens']:,} "
+                f"(cached {s['cached_input_tokens']:,}, "
+                f"{100 * s['cache_hit_rate']:.1f}%)  "
+                f"output {s['output_tokens']:,}")
+
+
+#: Process-wide verifier token counter, updated by every `call_*` in this
+#: module. Read it with ``USAGE.snapshot()``; zero it with ``USAGE.reset()``.
+USAGE = TokenUsage()
+
+
+def token_usage():
+    """Snapshot of the verifier token usage accumulated so far."""
+    return USAGE.snapshot()
+
+
+def format_usage(usage, title="Verifier tokens"):
+    """Render a `TokenUsage` (or its snapshot dict) as report lines."""
+    s = usage.snapshot() if isinstance(usage, TokenUsage) else usage
+    return [
+        f"{title} ({s['calls']:,} verifier calls)",
+        f"  {'input':<24s}  {s['input_tokens']:>16,d}",
+        f"  {'  cached input':<24s}  {s['cached_input_tokens']:>16,d}  "
+        f"({100 * s['cache_hit_rate']:.1f}% hit rate)",
+        f"  {'  uncached input':<24s}  {s['uncached_input_tokens']:>16,d}",
+        f"  {'output':<24s}  {s['output_tokens']:>16,d}",
+        f"  {'  reasoning':<24s}  {s['reasoning_tokens']:>16,d}",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -189,10 +389,8 @@ def load_image(image):
 
 def resolve_model(client, model=DEFAULT_MODEL):
     """The model name to send to `client`. For an OpenAI-compatible client
-    still pointed at the Gemini default, ask the server what it serves (a
-    vLLM instance serves exactly one model) and cache the answer, so
-    ``select(...)`` works against a local server without a ``model=``
-    argument."""
+    left on the Gemini default, ask the server what it serves and cache the
+    answer, so a local server works without a ``model=`` argument."""
     if not _is_openai_client(client) or model != DEFAULT_MODEL:
         return model
     served = getattr(client, "_llm_verifier_model", None)
@@ -231,6 +429,7 @@ def call_openai(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
             **params)
     except Exception:
         response = client.chat.completions.create(**params)
+    USAGE.record(response)
 
     choice = response.choices[0]
     text = choice.message.content or ""
@@ -247,12 +446,12 @@ def call_openai(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
                 alts = [(pos.token, pos.logprob)]
             position_logprobs.append(alts)
 
-    # Open models don't reliably emit the requested score tags (or fill
-    # them with digits instead of scale letters). Instead of trusting the
-    # sampled tags, keep only the analysis, then prefill each tag and read
-    # the letter distribution at exactly that position.
+    # Open models don't reliably emit the score tags, so keep only the
+    # analysis, prefill each tag, and read the letter distribution at that
+    # exact position. DeepSeek emits the tags itself (and lacks the prefill
+    # params), so it skips this.
     tags = [t for t in ("<score_A>", "<score_B>") if t in prompt]
-    if tags:
+    if tags and not getattr(client, "_llm_verifier_deepseek", False):
         idx = min([text.find(t) for t in tags if t in (text or "")]
                   or [len(text or "")])
         analysis = (text or "")[:idx].rstrip()
@@ -265,14 +464,11 @@ def call_openai(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
 
 def _score_tags_by_prefill(client, model, messages, text, tags,
                            top_logprobs=20):
-    """Read the `<score_X>` letter distributions by prefill. For each tag,
-    continue the assistant message with the analysis plus the tag prefilled
-    (vLLM/SGLang ``continue_final_message``), constrained to the 20 scale
-    letters via structured outputs where supported, and read the verifier's
-    renormalized letter distribution at exactly that position. Returns
-    (text, tokens, position_logprobs) in the `call_gemini` shape; a server
-    without prefill support returns them tag-less (scores fall back to
-    0.5)."""
+    """Read each `<score_X>` letter distribution by prefilling the tag
+    (vLLM/SGLang ``continue_final_message``), constrained to the scale
+    letters via structured outputs. Returns (text, tokens,
+    position_logprobs); a server without prefill support returns them
+    tag-less (scores fall back to 0.5)."""
     tokens = []
     position_logprobs = []
     for tag in tags:
@@ -300,6 +496,7 @@ def _score_tags_by_prefill(client, model, messages, text, tags,
             )
         except Exception:
             return text, tokens or None, position_logprobs or None
+        USAGE.record(response)
         choice = response.choices[0]
         letter = (choice.message.content or "").strip()
         alts = []
@@ -314,10 +511,64 @@ def _score_tags_by_prefill(client, model, messages, text, tags,
     return text, tokens or None, position_logprobs or None
 
 
+def call_deepseek(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
+                  images=None):
+    """Call the DeepSeek API with token-level logprobs and thinking enabled.
+
+    A call whose reasoning consumed the whole output budget (no answer, no
+    logprobs) raises rather than silently scoring a 0.5/0.5 tie. Returns
+    (text, tokens, position_logprobs) in the `call_gemini` shape.
+    """
+    content = prompt
+    imgs = as_image_list(images)
+    if imgs:
+        content = [{"type": "text", "text": prompt}]
+        for img in imgs:
+            data, mime = load_image(img)
+            b64 = base64.b64encode(data).decode("ascii")
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{b64}"}})
+    extra_body, max_tokens = deepseek_reasoning_params()
+    response = client.chat.completions.create(
+        model=resolve_model(client, model),
+        messages=[{"role": "user", "content": content}],
+        max_tokens=max_tokens,
+        temperature=1.0,
+        logprobs=True,
+        top_logprobs=top_logprobs,
+        extra_body=extra_body,
+    )
+    USAGE.record(response)
+    choice = response.choices[0]
+    text = choice.message.content or ""
+    tokens = None
+    position_logprobs = None
+    if choice.logprobs and choice.logprobs.content:
+        tokens, position_logprobs = [], []
+        for pos in choice.logprobs.content:
+            tokens.append(pos.token)
+            alts = [(alt.token, alt.logprob)
+                    for alt in (pos.top_logprobs or [])]
+            if not alts:
+                alts = [(pos.token, pos.logprob)]
+            position_logprobs.append(alts)
+    if not position_logprobs:
+        # Reasoning consumed the whole budget: no score distribution to read.
+        raise RuntimeError(
+            "DeepSeek returned no answer logprobs "
+            f"(finish_reason={choice.finish_reason!r}, "
+            f"reasoning consumed the {max_tokens}-token budget); "
+            "raise DEEPSEEK_MAX_TOKENS or lower DEEPSEEK_EFFORT")
+    return text, tokens, position_logprobs
+
+
 def call_verifier(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
                   images=None):
-    """Backend dispatch: route to the OpenAI-compatible or Gemini call based
-    on the client type. Returns (text, tokens, position_logprobs)."""
+    """Route to the DeepSeek, OpenAI-compatible, or Gemini call based on the
+    client type. Returns (text, tokens, position_logprobs)."""
+    if getattr(client, "_llm_verifier_deepseek", False):
+        return call_deepseek(client, prompt, model, top_logprobs,
+                             images=images)
     if _is_openai_client(client):
         return call_openai(client, prompt, model, top_logprobs, images=images)
     return call_gemini(client, prompt, model, top_logprobs, images=images)
@@ -348,6 +599,7 @@ def call_gemini(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
         contents=[Content(role="user", parts=parts)],
         config=config,
     )
+    USAGE.record(response)
 
     text = response.text or ""
     tokens = None
@@ -373,12 +625,20 @@ def call_gemini(client, prompt, model=DEFAULT_MODEL, top_logprobs=20,
 def _find_tag_logprobs(tokens, position_logprobs, tag):
     if not tokens or not position_logprobs:
         return None
-    text_so_far = ""
-    for i, tok in enumerate(tokens):
-        text_so_far += tok
-        if text_so_far.rstrip().endswith(tag):
-            if i + 1 < len(position_logprobs):
-                return position_logprobs[i + 1]
+    # Some tokenizers fuse the closing '>' with the score letter ('>A'), so
+    # try the exact tag first, then the tag without its trailing '>'. Take
+    # the LAST match: the verdict is the score block at the end of the reply,
+    # not the model quoting the format mid-analysis.
+    for suffix in (tag, tag[:-1]):
+        found = None
+        text_so_far = ""
+        for i, tok in enumerate(tokens):
+            text_so_far += tok
+            if text_so_far.rstrip().endswith(suffix):
+                if i + 1 < len(position_logprobs):
+                    found = position_logprobs[i + 1]
+        if found is not None:
+            return found
     return None
 
 
@@ -392,6 +652,8 @@ def extract_score(text, tokens, position_logprobs, tag):
     if tag_lp:
         for tok_str, logprob in tag_lp:
             tok = tok_str.strip()
+            if tok.startswith(">"):  # DeepSeek fuses '>' with the letter
+                tok = tok[1:].strip()
             if tok in valid_tokens:
                 val = valid_tokens[tok]
                 p = math.exp(logprob)
@@ -407,7 +669,9 @@ def extract_score(text, tokens, position_logprobs, tag):
 
     tag_name = tag.strip("<>")
     pattern = rf"<{re.escape(tag_name)}>\s*(.+?)\s*</{re.escape(tag_name)}>"
-    match = re.search(pattern, text or "", re.IGNORECASE)
+    # Last match again: the verdict is the score block at the end.
+    matches = list(re.finditer(pattern, text or "", re.IGNORECASE))
+    match = matches[-1] if matches else None
     if match:
         tok = match.group(1).strip()
         raw_val = valid_tokens.get(tok)
@@ -431,39 +695,45 @@ def extract_score(text, tokens, position_logprobs, tag):
 
 def build_prompt(problem, trace_a, trace_b, criterion, ground_truth_note,
                  n_images=0):
-    """One pairwise prompt focused on a single evaluation criterion."""
+    """One pairwise prompt focused on a single evaluation criterion.
+
+    Everything not specific to the criterion (task, both trajectories, rating
+    scale) comes first; only the criterion varies at the tail. This maximizes
+    the shared prompt prefix across criteria, so a prefix-caching backend
+    serves the trace-heavy body from cache. Keep criterion-specific text
+    strictly at the end when editing."""
     images_note = (
         f"**Attached images:** {n_images} image(s) are attached to this "
         "message, in order; they are part of the task context.\n\n"
         if n_images else "")
     return (
         "You are an expert evaluator of AI coding agents. "
-        "You will see a task description and two agent trajectories. "
-        f"Your job is to evaluate them on ONE specific criterion: "
-        f"**{criterion['name']}**.\n\n"
+        "You will see a task description and two agent trajectories, then "
+        "evaluate them on ONE specific criterion, stated at the end.\n\n"
         f"{ground_truth_note}\n\n"
         f"**Task:**\n{problem}\n\n"
         f"{images_note}"
         f"**Trajectory A:**\n{trace_a}\n\n"
         f"**Trajectory B:**\n{trace_b}\n\n"
+        f"**Rating Scale:**\n{SCALE['scale_description']}\n\n"
         f"**Evaluation Guideline — {criterion['name']}:**\n"
         f"{criterion['description']}\n\n"
-        f"Score each trajectory ONLY on this specific criterion. Ignore other "
-        f"aspects of the trajectory that are not relevant to "
-        f"\"{criterion['name']}\".\n\n"
-        f"**Rating Scale:**\n{SCALE['scale_description']}\n\n"
-        "Then output your final scores:\n"
-        f"<score_A>{SCALE['score_format']}</score_A>\n"
-        f"<score_B>{SCALE['score_format']}</score_B>\n\n"
+        f"Score each trajectory ONLY on this specific criterion "
+        f"(\"{criterion['name']}\"). Ignore other aspects of the trajectory "
+        f"that are not relevant to it.\n\n"
+        "Reason it through first, then END your reply with exactly these two "
+        "lines and nothing after them. Replace each placeholder with a single "
+        "letter A-T, keeping the spaces around the letter exactly as shown:\n"
+        f"<score_A> {SCALE['score_format']} </score_A>\n"
+        f"<score_B> {SCALE['score_format']} </score_B>\n\n"
         "Begin your analysis now."
     )
 
 
 def score_pair_criterion(client, problem, trace_a, trace_b, criterion,
                          ground_truth_note, model=DEFAULT_MODEL, images=None):
-    """Score (A, B) for a single criterion, returning fine-grained
-    rewards (R_A, R_B) in [0, 1]. `images` (one image or a list) is attached
-    to the verifier message as task context."""
+    """Score (A, B) for a single criterion, returning fine-grained rewards
+    (R_A, R_B) in [0, 1]. `images` is attached as task context."""
     imgs = as_image_list(images)
     prompt = build_prompt(
         problem, trace_a, trace_b, criterion, ground_truth_note,
@@ -476,23 +746,21 @@ def score_pair_criterion(client, problem, trace_a, trace_b, criterion,
 
 
 # ---------------------------------------------------------------------------
-# Directed cache key + the per-comparison reward used by the tournament
+# Directed cache key + the per-comparison reward used by the tournament.
+# Comparisons are *directed*: (a, b) and (b, a) are distinct cache entries,
+# which the ring pass relies on to cancel the verifier's slot bias. Odd reps
+# swap the prompt slots, so with K >= 2 the bias also cancels within one
+# directed comparison. "score_A"/"score_B" always mean candidate a's / b's
+# reward, whichever slot they occupied.
 # ---------------------------------------------------------------------------
-#
-# Comparisons are *directed*: candidate `a` is shown in slot A and `b` in slot
-# B of the verifier prompt. PPT's ring pass relies on this — each candidate is
-# placed in A exactly once and in B exactly once around the cycle, so the
-# verifier's slot bias cancels. The cache key therefore records the ordered
-# pair (a, b); (a, b) and (b, a) are distinct entries.
 
 def cache_key(crit_id, task_name, a, b, rep):
     return f"{crit_id}|{task_name}|{a},{b}|{rep}"
 
 
 def directed_reward(scores, task_name, a, b, criteria_ids, n_reps):
-    """Fine-grained rewards (R_a, R_b) for the directed comparison (a in slot
-    A, b in slot B), averaged over all criteria and repeated verifications.
-    Missing entries default to a tie (0.5)."""
+    """Fine-grained rewards (R_a, R_b) for the directed comparison (a, b),
+    averaged over criteria and repeats. Missing entries default to 0.5."""
     if a == b:
         return 0.5, 0.5
     sa = sb = 0.0
@@ -507,8 +775,7 @@ def directed_reward(scores, task_name, a, b, criteria_ids, n_reps):
 
 
 class LazyClient:
-    """Create the verifier client on first use (OpenAI-compatible when
-    ``OPENAI_BASE_URL`` is set, Gemini otherwise), so reproducing a fully
+    """Create the verifier client on first use, so reproducing a fully
     cached run never needs an API key."""
 
     def __init__(self):
@@ -524,34 +791,24 @@ class LazyClient:
 # Cached batch scoring — only the directed pairs PPT actually needs
 # ---------------------------------------------------------------------------
 
-def _progress_iter(futures, progress):
-    """Wrap `as_completed(futures)` in tqdm when progress is on and tqdm is
-    available; fall back to plain iteration otherwise."""
-    it = as_completed(futures)
-    if not progress:
-        return it, lambda **kw: None
-    try:
-        from tqdm import tqdm
-    except ImportError:
-        return it, lambda **kw: None
-    pbar = tqdm(it, total=len(futures), desc="Scoring")
-    return pbar, pbar.set_postfix
-
-
 def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                          ground_truth_note, n_reps, max_workers, cache_file,
                          model=DEFAULT_MODEL, progress=True, on_error="tie"):
     """Score every (criterion, rep) for the requested directed (task, a, b)
     pairs and merge into the cache on disk.
 
-    `needed_pairs` maps task_name -> iterable of directed (a, b) comparisons.
-    Only comparisons missing from the cache trigger API calls, so the cost of a
-    run scales with the PPT comparison count, not C(N, 2).
+    `needed_pairs` maps task_name -> iterable of directed (a, b) comparisons;
+    only comparisons missing from the cache trigger API calls. Odd reps swap
+    the prompt slots (scores are recorded back in candidate order), so with
+    `n_reps` >= 2 slot bias cancels within each comparison.
 
-    `on_error` controls failed verifier calls: ``"tie"`` scores the comparison
-    0.5/0.5 for this run only (failures are **never written to the cache**, so
-    a transient API error can't become a permanent fake tie), ``"raise"``
-    re-raises the first failure. Returns the merged scores dict."""
+    Prefix-cache warming: the backend's prefix cache is only populated once a
+    request returns, so one job per distinct prompt prefix runs to completion
+    first; the rest then fan out against the warm cache.
+
+    `on_error`: ``"tie"`` scores a failed call 0.5/0.5 for this run only
+    (failures are never written to the cache), ``"raise"`` re-raises the
+    first failure. Returns the merged scores dict."""
     if on_error not in ("tie", "raise"):
         raise ValueError(f"on_error must be 'tie' or 'raise', got {on_error!r}")
 
@@ -568,9 +825,17 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                 for rep in range(n_reps):
                     key = cache_key(crit["id"], task_name, a, b, rep)
                     if key not in cached:
-                        jobs.append((key, trials[a]["problem"],
-                                     trials[a]["trace"], trials[b]["trace"],
-                                     crit, trials[a].get("images")))
+                        swap = rep % 2 == 1
+                        ta, tb = trials[a]["trace"], trials[b]["trace"]
+                        if swap:
+                            ta, tb = tb, ta
+                        # Prompts with the same (task, slot-A, slot-B) share
+                        # a prefix.
+                        sa, sb = (b, a) if swap else (a, b)
+                        prefix = (task_name, sa, sb)
+                        jobs.append((key, trials[a]["problem"], ta, tb,
+                                     crit, trials[a].get("images"), swap,
+                                     prefix))
 
     log = print if progress else (lambda *a, **kw: None)
 
@@ -578,49 +843,83 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
         log(f"  All scores cached ({len(cached)} entries)")
         return cached
 
-    log(f"  {len(jobs)} scoring jobs ({len(cached)} cached)")
+    # Warm-up wave: one job per distinct prompt prefix, then the rest.
+    seen = set()
+    warm, rest = [], []
+    for job in jobs:
+        prefix = job[7]
+        if prefix in seen:
+            rest.append(job)
+        else:
+            seen.add(prefix)
+            warm.append(job)
+
+    log(f"  {len(jobs)} scoring jobs ({len(cached)} cached); "
+        f"warming {len(warm)} prefixes")
 
     client = lazy_client.get()
-    # `results` is what this run sees; `cached` is what gets persisted.
-    # Error ties go into `results` only.
+    usage_before = USAGE.copy()
+    # `results` is what this run sees; `cached` is what gets persisted
+    # (error ties go into `results` only).
     results = dict(cached)
     errors = 0
+    done = 0
+    save_every = max(1, len(jobs) // 20)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(score_pair_criterion, client, prob, ta, tb, crit,
-                            ground_truth_note, model, images): key
-            for key, prob, ta, tb, crit, images in jobs
-        }
-        iterator, set_postfix = _progress_iter(futures, progress)
-        save_every = max(1, len(futures) // 20)
-        done = 0
+    pbar = None
+    if progress:
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(total=len(jobs), desc="Scoring")
+        except ImportError:
+            pbar = None
 
-        for future in iterator:
-            key = futures[future]
-            try:
-                ra, rb = future.result()
-                entry = {"score_A": ra, "score_B": rb}
-                cached[key] = entry
-                results[key] = entry
-            except Exception as e:
-                if on_error == "raise":
-                    for f in futures:
-                        f.cancel()
-                    raise
-                errors += 1
-                results[key] = {"score_A": 0.5, "score_B": 0.5}
-                if errors <= 3:
-                    log(f"\n  Error: {e}")
-            done += 1
-            set_postfix(errors=errors)
-            if cache_file and done % save_every == 0:
-                with open(cache_file, "w") as f:
-                    json.dump(cached, f)
+    def run_phase(phase_jobs):
+        nonlocal errors, done
+        if not phase_jobs:
+            return
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(score_pair_criterion, client, prob, ta, tb,
+                                crit, ground_truth_note, model, images):
+                    (key, swap)
+                for key, prob, ta, tb, crit, images, swap, _ in phase_jobs
+            }
+            for future in as_completed(futures):
+                key, swap = futures[future]
+                try:
+                    ra, rb = future.result()
+                    if swap:  # scores back in candidate order
+                        ra, rb = rb, ra
+                    entry = {"score_A": ra, "score_B": rb}
+                    cached[key] = entry
+                    results[key] = entry
+                except Exception as e:
+                    if on_error == "raise":
+                        for f in futures:
+                            f.cancel()
+                        raise
+                    errors += 1
+                    results[key] = {"score_A": 0.5, "score_B": 0.5}
+                    if errors <= 3:
+                        log(f"\n  Error: {e}")
+                done += 1
+                if pbar is not None:
+                    pbar.update(1)
+                    pbar.set_postfix(errors=errors)
+                if cache_file and done % save_every == 0:
+                    with open(cache_file, "w") as f:
+                        json.dump(cached, f)
+
+    run_phase(warm)
+    run_phase(rest)
+    if pbar is not None:
+        pbar.close()
 
     if cache_file:
         with open(cache_file, "w") as f:
             json.dump(cached, f)
 
     log(f"  Done ({errors} errors)")
+    log(f"  Tokens: {USAGE - usage_before}")
     return results

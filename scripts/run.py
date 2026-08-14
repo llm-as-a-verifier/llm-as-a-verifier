@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 """
-Run LLM-as-a-Verifier on a benchmark from the registry in llm_verifier/benchmarks.py.
+Run LLM-as-a-Verifier on a benchmark from llm_verifier/benchmarks.py.
 
-Pipeline:
-  1. Load the benchmark trajectories (llm_verifier/loaders.py).
-  2. Load the verifier criteria + ground-truth note (criteria/<benchmark>.md).
-  3. For every "swing" task (where the N trials disagree), run a Probabilistic
-     Pivot Tournament (llm_verifier/pivot_tournament.py): a random ring pass,
-     pivots = empirical leaders, then pivot rounds. Only the directed pairs the
-     tournament needs are scored, with caching (fine_grained_reward.py).
-  4. Report Pass@1 vs LLM-as-a-Verifier vs Oracle.
-
-Scoring is two-phase because step 3's pivots depend on the ring-pass results:
-first score all ring pairs, then choose pivots, then score the pivot rounds.
+Loads the trajectories and criteria, runs a Probabilistic Pivot Tournament
+on every "swing" task (where the N trials disagree), and reports Pass@1 vs
+LLM-as-a-Verifier vs Oracle. Scoring is two-phase because the pivots depend
+on the ring-pass results: score all ring pairs first, then the pivot rounds.
 
 Usage:
     python scripts/run.py                  # list available benchmarks
@@ -31,9 +24,12 @@ sys.path.insert(0, ROOT_DIR)
 from llm_verifier.benchmarks import BENCHMARKS
 from llm_verifier.fine_grained_reward import (
     GRANULARITY,
+    USAGE,
     LazyClient,
     MissingAPIKeyError,
+    default_max_workers,
     directed_reward,
+    format_usage,
     load_dotenv,
     score_directed_pairs,
 )
@@ -85,15 +81,44 @@ def main():
                         help="Override config repeated verifications K")
     parser.add_argument("--seed", type=int, default=None,
                         help="Override config seed for the random ring pass")
-    parser.add_argument("--max-workers", type=int, default=50)
+    parser.add_argument("--max-workers", type=int, default=None,
+                        help="verifier-call concurrency (default: 500 on "
+                             "DeepSeek, 50 otherwise)")
+    parser.add_argument("--n-trials", type=int, default=None,
+                        help="use only the first N trials of each task "
+                             "(best-of-N; default: every trial on disk)")
     args = parser.parse_args()
 
     cfg = resolve_config(args.benchmark)
+    result = run_benchmark(
+        cfg,
+        pivots=args.pivots,
+        n_evaluations=args.n_evaluations,
+        seed=args.seed,
+        max_workers=args.max_workers,
+        n_trials=args.n_trials,
+    )
+    report(cfg, **result)
 
-    k = args.pivots if args.pivots is not None else cfg.pivots
-    n_reps = (args.n_evaluations if args.n_evaluations is not None
+
+def run_benchmark(cfg, pivots=None, n_evaluations=None, seed=None,
+                  max_workers=None, n_trials=None, cache_file=None,
+                  results_file=None):
+    """Score one benchmark end to end and return the metrics.
+
+    Every argument except `cfg` overrides the benchmark's own setting, so a
+    caller can pin a configuration (see scripts/run_bo3.py / run_bo5.py).
+    `n_trials` truncates each task to its first N trials (best-of-5 data ->
+    best-of-3 run). Returns the keyword arguments `report` expects.
+    """
+    k = pivots if pivots is not None else cfg.pivots
+    n_reps = (n_evaluations if n_evaluations is not None
               else cfg.n_evaluations)
-    seed = args.seed if args.seed is not None else cfg.seed
+    seed = seed if seed is not None else cfg.seed
+    # concurrency: explicit argument > benchmark config > backend default
+    if max_workers is None:
+        max_workers = (cfg.max_workers if cfg.max_workers is not None
+                       else default_max_workers())
 
     # ---- criteria + ground-truth note ----
     note, all_criteria = load_prompts(cfg.prompts)
@@ -103,15 +128,21 @@ def main():
     # ---- data ----
     print(f"Loading {cfg.name} ...")
     tasks, n_runs = LOADERS[cfg.loader](cfg.data, ROOT_DIR)
+    if n_trials:
+        # First N trials per task (stable: the loader sorts by file name).
+        tasks = {name: trials[:n_trials] for name, trials in tasks.items()}
+        n_runs = min(n_runs, n_trials)
     n_tasks = len(tasks)
     all_pass, swing = classify(tasks)
     print(f"  tasks={n_tasks}  all-pass={len(all_pass)}  swing={len(swing)}  "
           f"N(trials)={n_runs}")
-    print(f"  criteria={criteria_ids}  K={n_reps}  pivots={k}  seed={seed}")
+    print(f"  criteria={criteria_ids}  K={n_reps}  pivots={k}  seed={seed}  "
+          f"max_workers={max_workers}")
 
-    cache_file = _abs(cfg.cache)
+    cache_file = _abs(cache_file or cfg.cache)
     os.makedirs(os.path.dirname(cache_file), exist_ok=True)
     lazy = LazyClient()
+    usage_before = USAGE.copy()
 
     def score_fn(scores):
         def directed(a, b, t):
@@ -126,7 +157,7 @@ def main():
     # ---- phase A: score all ring pairs ----
     print("Phase A: ring pass")
     scores = score_directed_pairs(
-        lazy, tasks, rings, criteria, note, n_reps, args.max_workers,
+        lazy, tasks, rings, criteria, note, n_reps, max_workers,
         cache_file)
     directed = score_fn(scores)
 
@@ -145,7 +176,7 @@ def main():
     # ---- phase B: score all pivot-round pairs ----
     print("Phase B: pivot rounds")
     scores = score_directed_pairs(
-        lazy, tasks, pr_pairs, criteria, note, n_reps, args.max_workers,
+        lazy, tasks, pr_pairs, criteria, note, n_reps, max_workers,
         cache_file)
     directed = score_fn(scores)
 
@@ -171,12 +202,18 @@ def main():
     oracle = len(all_pass) + len(swing)
     avg_cmp = total_comparisons / max(1, len(swing))
 
-    report(cfg, n_tasks, n_runs, len(swing), criteria_ids, n_reps, k, seed,
-           pass1, verifier, oracle, avg_cmp)
+    return dict(
+        n_tasks=n_tasks, n_runs=n_runs, n_swing=len(swing),
+        criteria_ids=criteria_ids, n_reps=n_reps, k=k, seed=seed,
+        pass1=pass1, verifier=verifier, oracle=oracle, avg_cmp=avg_cmp,
+        usage=USAGE - usage_before,  # this call's usage only
+        comparisons=total_comparisons, results_file=results_file,
+    )
 
 
 def report(cfg, n_tasks, n_runs, n_swing, criteria_ids, n_reps, k, seed,
-           pass1, verifier, oracle, avg_cmp):
+           pass1, verifier, oracle, avg_cmp, usage=USAGE, comparisons=None,
+           results_file=None):
     lines = [
         "",
         "=" * 72,
@@ -194,10 +231,13 @@ def report(cfg, n_tasks, n_runs, n_swing, criteria_ids, n_reps, k, seed,
         f"{100 * verifier / n_tasks:>6.1f}%",
         f"{'Oracle (Bo' + str(n_runs) + ')':<26s}  {oracle:>8d}/{n_tasks}  "
         f"{100 * oracle / n_tasks:>6.1f}%",
+        "-" * 72,
+        # Tokens used by THIS run; cached comparisons use none.
+        *format_usage(usage),
         "",
     ]
     print("\n".join(lines))
-    results_file = _abs(cfg.results)
+    results_file = _abs(results_file or cfg.results)
     os.makedirs(os.path.dirname(results_file), exist_ok=True)
     with open(results_file, "w") as f:
         f.write("\n".join(lines))
