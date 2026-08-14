@@ -32,12 +32,11 @@ pip install -e .
 
 **What's new in 0.2.0** (full notes in [CHANGELOG.md](CHANGELOG.md)):
 
-- `deepseek-v4-flash` verifier backend
 - Prefix-cache optimization: ~3.4× fewer uncached input tokens on
   trajectory-heavy benchmarks
-- Token accounting (`llm_verifier.token_usage()`)
 - Terminal-Bench 2.1 [self-verification benchmark](#self-verification-terminal-bench-21)
-
+- `deepseek-v4-flash` verifier backend
+- Token accounting (`llm_verifier.token_usage()`)
 ---
 
 ## About
