@@ -185,6 +185,7 @@ result = llm_verifier.select(
     model="gemini-2.5-flash",          # verifier model
     n_evaluations=4,                 # repeated evaluations per criterion
     pivots=2,                          # pivots < N; reduced verification cost
+    cache="cache/my_task.json",       # safe to reuse across identical inputs
 )
 
 print("Best candidate:", result.index)            
@@ -196,6 +197,12 @@ Under the hood, `select` runs the
 `N` trajectories using `O(Nk)` pairwise verifications instead of a full
 `O(N²)` round-robin. `pivots` trades cost for accuracy: more pivots = more
 comparisons = higher accuracy.
+
+Score-cache entries are reused only when the generated verifier prompt, model,
+and image inputs match. Changing the problem, either candidate, a criterion, or
+the model automatically triggers fresh scoring. Raw bytes and local images are
+content-addressed; image URLs are identified by URL, so use immutable URLs or a
+fresh cache path when their remote content changes.
 
 ### Adapt LLM-as-a-Verifier for your own use case
 

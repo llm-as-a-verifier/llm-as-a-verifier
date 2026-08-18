@@ -16,6 +16,7 @@ any OpenAI-compatible server with logprobs), the score expectation
 """
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -28,6 +29,7 @@ DEEPSEEK_MODEL = "deepseek-v4-flash"
 
 DEFAULT_MAX_WORKERS = 50
 DEEPSEEK_MAX_WORKERS = 500
+CACHE_INPUT_VERSION = 1
 
 # DeepSeek reasoning settings. The reasoning trace shares the output budget
 # with the answer, so the budget must cover both — too small and the call is
@@ -758,6 +760,48 @@ def cache_key(crit_id, task_name, a, b, rep):
     return f"{crit_id}|{task_name}|{a},{b}|{rep}"
 
 
+def _image_cache_identity(image):
+    """Stable identity for an image supplied to the verifier.
+
+    Local files and raw bytes are content-addressed. URLs are identified by
+    their declared value; callers using mutable URLs should use a fresh cache
+    path when the remote content changes.
+    """
+    if isinstance(image, bytes):
+        return {"kind": "bytes", "sha256": hashlib.sha256(image).hexdigest()}
+    if isinstance(image, (str, os.PathLike)):
+        value = os.fspath(image)
+        if value.startswith(("http://", "https://")):
+            return {"kind": "url", "value": value}
+        try:
+            with open(value, "rb") as image_file:
+                digest = hashlib.sha256(image_file.read()).hexdigest()
+            return {"kind": "file", "sha256": digest}
+        except OSError:
+            # Preserve the scorer's existing error handling for unreadable
+            # paths instead of failing while the job list is assembled.
+            return {"kind": "file", "value": os.path.abspath(value)}
+    return {"kind": type(image).__name__, "value": repr(image)}
+
+
+def _input_fingerprint(problem, trace_a, trace_b, criterion,
+                       ground_truth_note, model, images):
+    """SHA-256 of everything that determines a cached verifier request."""
+    imgs = as_image_list(images)
+    payload = {
+        "version": CACHE_INPUT_VERSION,
+        "model": model,
+        "prompt": build_prompt(
+            problem, trace_a, trace_b, criterion, ground_truth_note,
+            n_images=len(imgs)),
+        "images": [_image_cache_identity(image) for image in imgs],
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def directed_reward(scores, task_name, a, b, criteria_ids, n_reps):
     """Fine-grained rewards (R_a, R_b) for the directed comparison (a, b),
     averaged over criteria and repeats. Missing entries default to 0.5."""
@@ -814,7 +858,7 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
 
     cached = {}
     if cache_file and os.path.exists(cache_file):
-        with open(cache_file) as f:
+        with open(cache_file, encoding="utf-8") as f:
             cached = json.load(f)
 
     jobs = []
@@ -824,18 +868,24 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
             for crit in criteria:
                 for rep in range(n_reps):
                     key = cache_key(crit["id"], task_name, a, b, rep)
-                    if key not in cached:
-                        swap = rep % 2 == 1
-                        ta, tb = trials[a]["trace"], trials[b]["trace"]
-                        if swap:
-                            ta, tb = tb, ta
+                    swap = rep % 2 == 1
+                    ta, tb = trials[a]["trace"], trials[b]["trace"]
+                    if swap:
+                        ta, tb = tb, ta
+                    fingerprint = _input_fingerprint(
+                        trials[a]["problem"], ta, tb, crit,
+                        ground_truth_note, model,
+                        trials[a].get("images"))
+                    entry = cached.get(key)
+                    if (not isinstance(entry, dict)
+                            or entry.get("input_sha256") != fingerprint):
                         # Prompts with the same (task, slot-A, slot-B) share
                         # a prefix.
                         sa, sb = (b, a) if swap else (a, b)
                         prefix = (task_name, sa, sb)
                         jobs.append((key, trials[a]["problem"], ta, tb,
                                      crit, trials[a].get("images"), swap,
-                                     prefix))
+                                     prefix, fingerprint))
 
     log = print if progress else (lambda *a, **kw: None)
 
@@ -882,16 +932,21 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
             futures = {
                 executor.submit(score_pair_criterion, client, prob, ta, tb,
                                 crit, ground_truth_note, model, images):
-                    (key, swap)
-                for key, prob, ta, tb, crit, images, swap, _ in phase_jobs
+                    (key, swap, fingerprint)
+                for key, prob, ta, tb, crit, images, swap, _, fingerprint
+                in phase_jobs
             }
             for future in as_completed(futures):
-                key, swap = futures[future]
+                key, swap, fingerprint = futures[future]
                 try:
                     ra, rb = future.result()
                     if swap:  # scores back in candidate order
                         ra, rb = rb, ra
-                    entry = {"score_A": ra, "score_B": rb}
+                    entry = {
+                        "score_A": ra,
+                        "score_B": rb,
+                        "input_sha256": fingerprint,
+                    }
                     cached[key] = entry
                     results[key] = entry
                 except Exception as e:
@@ -908,7 +963,7 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                     pbar.update(1)
                     pbar.set_postfix(errors=errors)
                 if cache_file and done % save_every == 0:
-                    with open(cache_file, "w") as f:
+                    with open(cache_file, "w", encoding="utf-8") as f:
                         json.dump(cached, f)
 
     run_phase(warm)
@@ -917,7 +972,7 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
         pbar.close()
 
     if cache_file:
-        with open(cache_file, "w") as f:
+        with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(cached, f)
 
     log(f"  Done ({errors} errors)")
