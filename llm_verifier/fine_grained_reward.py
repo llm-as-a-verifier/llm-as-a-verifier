@@ -498,7 +498,18 @@ def _score_tags_by_prefill(client, model, messages, text, tags,
             return text, tokens or None, position_logprobs or None
         USAGE.record(response)
         choice = response.choices[0]
-        letter = (choice.message.content or "").strip()
+        # Servers running a reasoning parser (e.g. vLLM with
+        # --reasoning-parser deepseek_v4) classify the prefill-continued
+        # token as reasoning content, so message.content comes back None.
+        # Read the letter from the reasoning field in that case; otherwise
+        # the empty letter token leaves the accumulated text still ending
+        # with the tag, and _find_tag_logprobs's last-match rule overwrites
+        # the real score distribution with the closing-tag placeholder,
+        # silently collapsing every score to 0.5.
+        letter = (choice.message.content
+                  or getattr(choice.message, "reasoning", None)
+                  or getattr(choice.message, "reasoning_content", None)
+                  or "").strip()
         alts = []
         if choice.logprobs and choice.logprobs.content:
             pos = choice.logprobs.content[0]
@@ -634,7 +645,10 @@ def _find_tag_logprobs(tokens, position_logprobs, tag):
         text_so_far = ""
         for i, tok in enumerate(tokens):
             text_so_far += tok
-            if text_so_far.rstrip().endswith(suffix):
+            # `tok and` — an empty token (e.g. a reasoning parser swallowed
+            # the letter) must not re-match the tag and shadow the score
+            # distribution captured at the previous position.
+            if tok and text_so_far.rstrip().endswith(suffix):
                 if i + 1 < len(position_logprobs):
                     found = position_logprobs[i + 1]
         if found is not None:
