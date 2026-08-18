@@ -634,6 +634,14 @@ def _find_tag_logprobs(tokens, position_logprobs, tag):
         text_so_far = ""
         for i, tok in enumerate(tokens):
             text_so_far += tok
+            # A whitespace-only token leaves `text_so_far` unchanged after
+            # rstrip(), so the tag would match a SECOND time and advance `found`
+            # one slot past the real distribution onto the closing tag's
+            # placeholder. This fires whenever the constrained sample lands on a
+            # bare space -- a legal prefix of " A" in the choice list -- which
+            # strips to "" in _score_tags_by_prefill.
+            if not tok.strip():
+                continue
             if text_so_far.rstrip().endswith(suffix):
                 if i + 1 < len(position_logprobs):
                     found = position_logprobs[i + 1]
