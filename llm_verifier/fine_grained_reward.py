@@ -498,12 +498,23 @@ def _score_tags_by_prefill(client, model, messages, text, tags,
             return text, tokens or None, position_logprobs or None
         USAGE.record(response)
         choice = response.choices[0]
-        letter = (choice.message.content or "").strip()
+        # Servers running a reasoning parser (vLLM --reasoning-parser
+        # glm45 / deepseek_v4 / deepseek_r1, ...) classify the
+        # prefill-continued token as reasoning, so message.content is None.
+        # Read the letter from the reasoning field (as in PR #6), and if the
+        # server exposes neither, recover it from the logprobs: the top
+        # token at this position IS the sampled letter.
+        letter = (choice.message.content
+                  or getattr(choice.message, "reasoning", None)
+                  or getattr(choice.message, "reasoning_content", None)
+                  or "").strip()
         alts = []
         if choice.logprobs and choice.logprobs.content:
             pos = choice.logprobs.content[0]
             alts = [(alt.token, alt.logprob)
                     for alt in (pos.top_logprobs or [])]
+            if not letter:
+                letter = (pos.token or (alts[0][0] if alts else "")).strip()
         closing = "</" + tag[1:]
         text = prefix + letter + closing
         tokens += [f"\n{tag}", letter, closing]
@@ -634,6 +645,13 @@ def _find_tag_logprobs(tokens, position_logprobs, tag):
         text_so_far = ""
         for i, tok in enumerate(tokens):
             text_so_far += tok
+            # An empty or whitespace-only token (a reasoning parser swallowed
+            # the letter, or the constrained sample landed on a bare space, a
+            # legal prefix of " A") leaves the stripped text unchanged, so the
+            # tag would match a SECOND time and shadow the distribution captured
+            # at the previous position (#5, #10).
+            if not tok.strip():
+                continue
             if text_so_far.rstrip().endswith(suffix):
                 if i + 1 < len(position_logprobs):
                     found = position_logprobs[i + 1]
