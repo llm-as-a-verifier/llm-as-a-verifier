@@ -47,14 +47,14 @@ Notes:
 | Dependency resolution | The plugin's runtime dependencies (`@deepseek-ai/cordis`, `dsh-*`) are provided by the host Harness (peer dependencies); this directory only needs the build toolchain. Some rc packages on npm depend on unpublished internal packages (e.g. `@deepseek-ai/dsh-type-meta`), so a plain `pnpm install` fails with 404 — in that case use `scripts/link_dev_deps.*` to link `node_modules` to the pnpm virtual store of the deepseek-harness source repo (exactly matching the version you run locally; verified on this machine) |
 | `pnpm build` | Compiles `src/` to `lib/` with `tsc` (`lib/index.js` is the plugin entry); `pnpm-workspace.yaml` sets `verifyDepsBeforeRun: false` for compatibility with dev-link mode |
 | `dsh plugin --profile web add .` | Installs this plugin in the `web` profile: `dsh` forwards `pnpm add <absolute path to this dir>` to be run under `~/.dsh/profiles/web`; after installation, since `package.json` declares `dsh.bundle.patch`, the plugin is automatically added to that profile's `dsh.profile.bundles` layer |
-| Restart `dsh web` | After restart, the mount line in `cordis.patch.yml` (`name: dsh-plugin`) takes effect and all four tools become available |
+| Restart `dsh web` | After restart, the mount line in `cordis.patch.yml` (`name: llm-verifier-multipath`, matching the entry id) takes effect and all four tools become available |
 
 You can verify a successful installation like this:
 
 ```bash
 dsh --profile web --dump-config | grep -A2 llm-verifier-multipath
 # - id: llm-verifier-multipath
-#   name: dsh-plugin
+#   name: llm-verifier-multipath
 ```
 
 After startup (`dsh web`, visit http://127.0.0.1:3080), open a new session and ask the model to do multipath verification, for example:
@@ -89,7 +89,7 @@ The verifier (judge) model defaults to `deepseek-v4-flash` (provider `deepseek-o
 ```yaml
 - insert:
     - id: llm-verifier-multipath
-      name: dsh-plugin
+      name: llm-verifier-multipath
       config:
         # ... other settings ...
         provider: deepseek-official
@@ -174,7 +174,7 @@ dsh-plugin/
 ├── package.json          # Standard Node package; dsh.bundle.patch makes `dsh plugin add .` activate automatically
 ├── tsconfig.json         # Type checking
 ├── tsconfig.build.json   # pnpm build (outputs lib/)
-├── cordis.patch.yml      # Plugin mount line (bundle patch, name: dsh-plugin)
+├── cordis.patch.yml      # Plugin mount line (bundle patch, name: llm-verifier-multipath)
 ├── src/
 │   ├── index.ts          # Plugin entry: inject ['tools','llm','subagents','systemPrompt','agents']
 │   └── verifier.ts       # Judge prompt + ring/pivot tournament + win-mass aggregation

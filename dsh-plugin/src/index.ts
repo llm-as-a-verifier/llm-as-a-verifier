@@ -18,7 +18,7 @@
  * Candidate runs are kept in a process-local registry keyed by run id; the
  * registry lives for the lifetime of the runtime process.
  *
- * @module dsh-plugin
+ * @module llm-verifier-multipath
  */
 
 import { randomUUID } from 'node:crypto'

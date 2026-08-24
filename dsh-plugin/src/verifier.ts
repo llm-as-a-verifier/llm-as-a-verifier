@@ -10,7 +10,7 @@
  * positional bias cancels. A failed call scores a tie (0.5 / 0.5), matching
  * the Python verifier's `on_error="tie"` policy.
  *
- * @module dsh-plugin/verifier
+ * @module llm-verifier-multipath/verifier
  */
 
 import { randomUUID } from 'node:crypto'

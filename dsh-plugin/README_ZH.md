@@ -45,14 +45,14 @@ dsh plugin --profile web add .
 | 依赖解析 | 插件的运行时依赖（`@deepseek-ai/cordis`、`dsh-*`）由宿主 Harness 提供（peer 依赖），本目录只需构建工具链。npm 上部分 rc 包依赖未发布的内部包（如 `@deepseek-ai/dsh-type-meta`），直接 `pnpm install` 会 404 —— 此时改用 `scripts/link_dev_deps.*` 把 `node_modules` 链接到 deepseek-harness 源码仓库的 pnpm 虚拟仓库（与本机运行版本完全一致，本机实测通过） |
 | `pnpm build` | 用 `tsc` 把 `src/` 编译到 `lib/`（`lib/index.js` 是插件的入口）；`pnpm-workspace.yaml` 已配置 `verifyDepsBeforeRun: false` 兼容 dev-link 模式 |
 | `dsh plugin --profile web add .` | 在 `web` profile 中安装本插件：`dsh` 会把 `pnpm add <本目录绝对路径>` 转发到 `~/.dsh/profiles/web` 下执行；安装完成后，由于 `package.json` 声明了 `dsh.bundle.patch`，插件会自动加入该 profile 的 `dsh.profile.bundles` 层 |
-| 重启 `dsh web` | 重启后 `cordis.patch.yml` 的挂载行（`name: dsh-plugin`）生效，四个工具可用 |
+| 重启 `dsh web` | 重启后 `cordis.patch.yml` 的挂载行（`name: llm-verifier-multipath`，与条目 id 一致）生效，四个工具可用 |
 
 安装是否成功可以这样验证：
 
 ```bash
 dsh --profile web --dump-config | grep -A2 llm-verifier-multipath
 # - id: llm-verifier-multipath
-#   name: dsh-plugin
+#   name: llm-verifier-multipath
 ```
 
 启动后（`dsh web`，访问 http://127.0.0.1:3080），新建会话并让模型执行多路径验证，例如：
@@ -87,7 +87,7 @@ run_paths(task, n) ──► submit_path(content) ──► list_paths(runId) �
 ```yaml
 - insert:
     - id: llm-verifier-multipath
-      name: dsh-plugin
+      name: llm-verifier-multipath
       config:
         # ... 其他配置 ...
         provider: deepseek-official
@@ -172,7 +172,7 @@ dsh-plugin/
 ├── package.json          # 标准 Node 包；dsh.bundle.patch 使 `dsh plugin add .` 自动激活
 ├── tsconfig.json         # 类型检查
 ├── tsconfig.build.json   # pnpm build（输出 lib/）
-├── cordis.patch.yml      # 插件挂载行（bundle patch，name: dsh-plugin）
+├── cordis.patch.yml      # 插件挂载行（bundle patch，name: llm-verifier-multipath）
 ├── src/
 │   ├── index.ts          # 插件入口：inject ['tools','llm','subagents','systemPrompt','agents']
 │   └── verifier.ts       # 判题提示词 + 环行/枢轴锦标赛 + win-mass 聚合
