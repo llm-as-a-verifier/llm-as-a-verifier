@@ -21,6 +21,7 @@ import math
 import os
 import re
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DEFAULT_MODEL = "gemini-2.5-flash"
@@ -387,6 +388,12 @@ def load_image(image):
     return data, _sniff_mime(data)
 
 
+#: Guards the lazy `client.models.list()` lookup in `resolve_model`. Without
+#: it the first scoring wave (up to `max_workers` threads) races and every
+#: thread issues its own list-models request.
+_RESOLVE_MODEL_LOCK = threading.Lock()
+
+
 def resolve_model(client, model=DEFAULT_MODEL):
     """The model name to send to `client`. For an OpenAI-compatible client
     left on the Gemini default, ask the server what it serves and cache the
@@ -395,8 +402,11 @@ def resolve_model(client, model=DEFAULT_MODEL):
         return model
     served = getattr(client, "_llm_verifier_model", None)
     if served is None:
-        served = client.models.list().data[0].id
-        client._llm_verifier_model = served
+        with _RESOLVE_MODEL_LOCK:
+            served = getattr(client, "_llm_verifier_model", None)
+            if served is None:
+                served = client.models.list().data[0].id
+                client._llm_verifier_model = served
     return served
 
 
@@ -809,9 +819,19 @@ class LazyClient:
 # Cached batch scoring — only the directed pairs PPT actually needs
 # ---------------------------------------------------------------------------
 
+def _save_cache(cache_file, cached):
+    """Write the score cache atomically: a crash or Ctrl-C mid-write leaves
+    the previous cache intact instead of truncating it to invalid JSON."""
+    tmp = f"{cache_file}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(cached, f)
+    os.replace(tmp, cache_file)
+
+
 def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                          ground_truth_note, n_reps, max_workers, cache_file,
-                         model=DEFAULT_MODEL, progress=True, on_error="tie"):
+                         model=DEFAULT_MODEL, progress=True, on_error="tie",
+                         stats=None):
     """Score every (criterion, rep) for the requested directed (task, a, b)
     pairs and merge into the cache on disk.
 
@@ -826,9 +846,17 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
 
     `on_error`: ``"tie"`` scores a failed call 0.5/0.5 for this run only
     (failures are never written to the cache), ``"raise"`` re-raises the
-    first failure. Returns the merged scores dict."""
+    first failure. `stats`: optional dict; on return it carries
+    ``{"errors": n, "scored": n, "cached": n}`` for this call, so a caller
+    can tell a clean run from one whose scores are mostly error ties.
+    Returns the merged scores dict."""
     if on_error not in ("tie", "raise"):
         raise ValueError(f"on_error must be 'tie' or 'raise', got {on_error!r}")
+    if stats is None:
+        stats = {}
+    stats.setdefault("errors", 0)
+    stats.setdefault("scored", 0)
+    stats.setdefault("cached", 0)
 
     cached = {}
     if cache_file and os.path.exists(cache_file):
@@ -856,6 +884,8 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                                      prefix))
 
     log = print if progress else (lambda *a, **kw: None)
+
+    stats["cached"] = len(cached)
 
     if not jobs:
         log(f"  All scores cached ({len(cached)} entries)")
@@ -926,8 +956,7 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                     pbar.update(1)
                     pbar.set_postfix(errors=errors)
                 if cache_file and done % save_every == 0:
-                    with open(cache_file, "w") as f:
-                        json.dump(cached, f)
+                    _save_cache(cache_file, cached)
 
     run_phase(warm)
     run_phase(rest)
@@ -935,9 +964,20 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
         pbar.close()
 
     if cache_file:
-        with open(cache_file, "w") as f:
-            json.dump(cached, f)
+        _save_cache(cache_file, cached)
+
+    stats["errors"] += errors
+    stats["scored"] += done - errors
 
     log(f"  Done ({errors} errors)")
     log(f"  Tokens: {USAGE - usage_before}")
+    # `log` is a no-op when progress is off (the default outside a TTY), so a
+    # run where every verifier call failed would otherwise return a full set
+    # of 0.5/0.5 ties without a single word of warning.
+    if errors and not progress:
+        warnings.warn(
+            f"{errors} of {len(jobs)} verifier calls failed and were scored "
+            f"as 0.5/0.5 ties (on_error='tie'). Pass on_error='raise' to fail "
+            f"loudly instead.",
+            RuntimeWarning, stacklevel=2)
     return results
