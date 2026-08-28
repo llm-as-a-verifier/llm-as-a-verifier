@@ -175,9 +175,12 @@ def run_benchmark(cfg, pivots=None, n_evaluations=None, seed=None,
 
     # ---- phase B: score all pivot-round pairs ----
     print("Phase B: pivot rounds")
-    scores = score_directed_pairs(
+    # Merge rather than rebind: phase B's return value only carries what it
+    # scored plus what was on disk, so the ring pass would otherwise reach
+    # the aggregation below only via the cache file.
+    scores.update(score_directed_pairs(
         lazy, tasks, pr_pairs, criteria, note, n_reps, max_workers,
-        cache_file)
+        cache_file))
     directed = score_fn(scores)
 
     # ---- step 3+4: aggregate ring + pivot rounds, select winner ----
