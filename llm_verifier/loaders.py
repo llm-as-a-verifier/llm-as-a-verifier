@@ -188,13 +188,15 @@ def _sb_format_trace(messages_str):
 def _sb_load_run(run_dir):
     single = os.path.join(run_dir, "data_cache.json")
     if os.path.exists(single):
-        return {item["instance_id"]: item for item in json.load(open(single))}
+        with open(single) as f:
+            return {item["instance_id"]: item for item in json.load(f)}
     items, idx = [], 0
     while True:
         part = os.path.join(run_dir, f"data_cache{idx}.json")
         if not os.path.exists(part):
             break
-        items.extend(json.load(open(part)))
+        with open(part) as f:
+            items.extend(json.load(f))
         idx += 1
     return {item["instance_id"]: item for item in items} if items else {}
 

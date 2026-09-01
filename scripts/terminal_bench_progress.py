@@ -19,11 +19,16 @@ import json
 import os
 import sys
 
-import matplotlib
+try:
+    import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+except ImportError:  # pragma: no cover - depends on the local environment
+    sys.exit("this script needs matplotlib and numpy, which are not runtime "
+             "dependencies of llm-verifier.\n"
+             "Install them with:  pip install \"llm-verifier[plot]\"")
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRAJ_DIR = os.path.join(ROOT_DIR, "data", "progress_tracking",

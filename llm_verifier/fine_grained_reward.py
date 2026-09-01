@@ -98,11 +98,12 @@ def load_dotenv(root_dir=None):
     directory) into the environment, without overriding existing values."""
     env_path = os.path.join(root_dir or os.getcwd(), ".env")
     if os.path.exists(env_path):
-        for line in open(env_path):
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
 
 
 def create_gemini_client():
