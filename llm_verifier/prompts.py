@@ -47,12 +47,22 @@ Expected criteria-file layout (see criteria/TEMPLATE.md):
 def _criteria_dirs():
     """Directories searched for a bare benchmark name, in order: the
     ``criteria/`` folder at the repository root (next to the ``llm_verifier``
-    package), then ``criteria/`` under the current working directory."""
+    package), then ``criteria/`` under the current working directory. The two
+    coincide when running from the repository root, so duplicates are dropped
+    to keep the "not found" message readable."""
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
-    return [
+    dirs = [
         os.path.join(os.path.dirname(pkg_dir), "criteria"),
         os.path.join(os.getcwd(), "criteria"),
     ]
+    seen = set()
+    unique = []
+    for d in dirs:
+        resolved = os.path.normpath(os.path.abspath(d))
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(d)
+    return unique
 
 
 def _read_criteria(path):
