@@ -173,10 +173,15 @@ def _expected_value_from_alts(
     for tok_str, lp in alts:
         # Some BPE tokenizers merge the tag's closing ">" with the answer
         # letter into one token (">B"); strip it so the letter still counts.
-        t = (tok_str or "").lstrip().lstrip(">").lstrip()
+        t = (tok_str or "").lstrip()
+        if t.startswith(">"):
+            t = t[1:].lstrip()
         if not t:
             continue
-        c = t[0]
+        c, rest = t[0], t[1:].lstrip()
+        # A score may share a token with its closing tag, but not a word.
+        if rest and not rest.startswith("</"):
+            continue
         if c in LETTER_TO_VALUE:
             v = LETTER_TO_VALUE[c]
             if v not in vals_to_lp or lp > vals_to_lp[v]:
