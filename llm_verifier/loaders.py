@@ -79,7 +79,7 @@ def load_terminal(data, root):
     agent_dir = _abs(root, data["agent_dir"])
     tasks = {}
     for task_dir in sorted(globmod.glob(os.path.join(agent_dir, "*/"))):
-        task_name = os.path.basename(task_dir.rstrip("/"))
+        task_name = os.path.basename(os.path.normpath(task_dir))
         traj_files = sorted(globmod.glob(
             os.path.join(task_dir, "*_trajectory.json")))
         trials = []
