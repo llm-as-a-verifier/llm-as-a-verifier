@@ -210,9 +210,14 @@ def select(
             on_error=on_error)
 
     # Phase A: ring pass (slot bias cancels around the cycle).
+    # `scores` accumulates both phases: score_directed_pairs returns the pairs
+    # it was asked for merged with whatever it read off disk, so with no cache
+    # file phase B's return value would carry only the pivot rounds and every
+    # ring lookup in the final aggregation would fall back to 0.5/0.5.
     rng = random.Random(seed)
     ring = ppt.ring_cycle(n, rng)
-    score = directed_for(score_pairs(ring))
+    scores = score_pairs(ring)
+    score = directed_for(scores)
 
     # Pivots = empirical leaders from the ring pass.
     w, c = [0.0] * n, [0] * n
@@ -221,7 +226,8 @@ def select(
     pr_pairs = ppt.pivot_round_pairs(n, pivot_set)
 
     # Phase B: score the pivot rounds, then aggregate everything.
-    score = directed_for(score_pairs(pr_pairs))
+    scores.update(score_pairs(pr_pairs))
+    score = directed_for(scores)
     w, c = [0.0] * n, [0] * n
     ppt.accumulate(ring, score, w, c)
     ppt.accumulate(pr_pairs, score, w, c)
