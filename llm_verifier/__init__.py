@@ -173,6 +173,8 @@ def select(
         MissingAPIKeyError: no credentials and no `client` given (only when
             uncached comparisons actually need scoring).
     """
+    if n_evaluations < 1:
+        raise ValueError("n_evaluations must be >= 1")
     note, crits = _resolve_criteria(criteria, ground_truth_note)
     criteria_ids = [c["id"] for c in crits]
     show_progress = _default_progress(progress)
