@@ -46,10 +46,16 @@ Expected criteria-file layout (see criteria/TEMPLATE.md):
 
 def _criteria_dirs():
     """Directories searched for a bare benchmark name, in order: the
-    ``criteria/`` folder at the repository root (next to the ``llm_verifier``
-    package), then ``criteria/`` under the current working directory."""
+    ``criteria/`` bundled inside the installed package, the ``criteria/``
+    folder at the repository root (next to the ``llm_verifier`` package),
+    then ``criteria/`` under the current working directory.
+
+    The bundled copy is what an installed wheel carries; the repository-root
+    copy is the same files in a source checkout, where the package has no
+    bundled directory beside it."""
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     return [
+        os.path.join(pkg_dir, "criteria"),
         os.path.join(os.path.dirname(pkg_dir), "criteria"),
         os.path.join(os.getcwd(), "criteria"),
     ]
