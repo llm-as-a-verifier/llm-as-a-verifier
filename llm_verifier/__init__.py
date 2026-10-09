@@ -7,9 +7,11 @@ runs use `scripts/run.py`.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 import sys
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence, Tuple, Union
@@ -80,6 +82,7 @@ class VerifierResult:
     scores: list[float] = field(repr=False)
     n_comparisons: int = 0
     criteria: list[str] = field(default_factory=list)
+    n_errors: int = 0
 
     @property
     def ranking(self) -> list[int]:
@@ -90,7 +93,8 @@ class VerifierResult:
     def __repr__(self) -> str:
         return (f"VerifierResult(index={self.index}, "
                 f"n_comparisons={self.n_comparisons}, "
-                f"criteria={self.criteria})")
+                f"criteria={self.criteria}, "
+                f"n_errors={self.n_errors})")
 
 
 def _resolve_criteria(criteria: CriteriaArg,
@@ -103,6 +107,30 @@ def _resolve_criteria(criteria: CriteriaArg,
     if ground_truth_note is not None:
         note = ground_truth_note
     return note, crits
+
+
+def _task_key(problem: str, candidates: Sequence[str], crits, model: str) -> str:
+    """Content-derived name for `select`'s synthetic task.
+
+    The score cache is keyed by (criterion, task name, pair, rep). This used
+    to be the literal string ``"task"``, so two `select` calls sharing a
+    ``cache=`` file — different problem, different candidates, even a
+    different verifier model — collided on every key and silently served each
+    other's scores. Hashing the actual inputs makes a cache hit mean the
+    comparison really was the same one.
+    """
+    h = hashlib.sha256()
+    h.update(problem.encode("utf-8", "replace"))
+    for c in candidates:
+        h.update(b"\x00")
+        h.update(str(c).encode("utf-8", "replace"))
+    for crit in crits:
+        h.update(b"\x01")
+        h.update(str(crit.get("id", "")).encode("utf-8", "replace"))
+        h.update(str(crit.get("description", "")).encode("utf-8", "replace"))
+    h.update(b"\x02")
+    h.update(str(model).encode("utf-8", "replace"))
+    return f"task_{h.hexdigest()[:16]}"
 
 
 def _default_progress(progress: Optional[bool]) -> bool:
@@ -189,8 +217,10 @@ def select(
         cache_dir = os.path.dirname(os.path.abspath(cache))
         os.makedirs(cache_dir, exist_ok=True)
 
-    # One synthetic task holding the N candidate trajectories.
-    task = "task"
+    # One synthetic task holding the N candidate trajectories. The name is
+    # derived from the inputs so a shared `cache=` file cannot serve one
+    # problem's scores for a different one.
+    task = _task_key(problem, candidates, crits, model)
     tasks = {task: [{"problem": problem, "trace": t, "reward": 0,
                      "images": images}
                     for t in candidates]}
@@ -198,6 +228,8 @@ def select(
     lazy = LazyClient()
     if client is not None:
         lazy._client = client
+
+    stats = {"errors": 0, "scored": 0, "cached": 0}
 
     def directed_for(scores):
         return lambda a, b: directed_reward(
@@ -207,12 +239,13 @@ def select(
         return score_directed_pairs(
             lazy, tasks, {task: pairs}, crits, note, n_evaluations,
             max_workers, cache, model=model, progress=show_progress,
-            on_error=on_error)
+            on_error=on_error, stats=stats)
 
     # Phase A: ring pass (slot bias cancels around the cycle).
     rng = random.Random(seed)
     ring = ppt.ring_cycle(n, rng)
-    score = directed_for(score_pairs(ring))
+    scores = score_pairs(ring)
+    score = directed_for(scores)
 
     # Pivots = empirical leaders from the ring pass.
     w, c = [0.0] * n, [0] * n
@@ -221,14 +254,32 @@ def select(
     pr_pairs = ppt.pivot_round_pairs(n, pivot_set)
 
     # Phase B: score the pivot rounds, then aggregate everything.
-    score = directed_for(score_pairs(pr_pairs))
+    #
+    # `score_directed_pairs` returns only what it loaded from the cache file
+    # plus what it just scored, so phase B's return value does NOT carry
+    # phase A's ring scores unless a `cache=` file happened to persist them.
+    # Merging them explicitly is what keeps the ring pass from silently
+    # degrading into 0.5/0.5 ties -- i.e. from throwing away N verifier calls
+    # that were already made and paid for.
+    scores = {**scores, **score_pairs(pr_pairs)}
+    score = directed_for(scores)
     w, c = [0.0] * n, [0] * n
     ppt.accumulate(ring, score, w, c)
     ppt.accumulate(pr_pairs, score, w, c)
     best = max(range(n), key=lambda i: (w[i] / c[i] if c[i] else 0.0, -i))
     mean_pref = [w[i] / c[i] if c[i] else 0.0 for i in range(n)]
+
+    if stats["errors"]:
+        warnings.warn(
+            f"{stats['errors']} verifier call(s) failed and were scored as "
+            f"0.5/0.5 ties; this selection is only as good as the "
+            f"{stats['scored']} that succeeded. See VerifierResult.n_errors, "
+            f"or pass on_error='raise'.",
+            RuntimeWarning, stacklevel=2)
+
     return VerifierResult(best, candidates[best], mean_pref,
-                          len(ring) + len(pr_pairs), criteria_ids)
+                          len(ring) + len(pr_pairs), criteria_ids,
+                          stats["errors"])
 
 
 def compare(
