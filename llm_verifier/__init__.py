@@ -154,8 +154,9 @@ def select(
         max_workers: concurrency for verifier calls (default: 500 on
             DeepSeek, 50 otherwise).
         model: verifier model name (default ``gemini-2.5-flash``).
-        cache: optional JSON score-cache path; re-runs only score
-            comparisons not seen before.
+        cache: optional JSON score-cache path. Entries are reused only when
+            the generated prompt, model, and image inputs match; legacy
+            entries without an input fingerprint are rescored.
         progress: show a progress bar. Default (``None``): only when stderr
             is a TTY.
         on_error: ``"tie"`` scores a failed verifier call 0.5/0.5 for this
