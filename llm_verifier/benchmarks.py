@@ -20,6 +20,7 @@ class Benchmark:
     cache: str                      # path to the verifier-score cache (JSON)
     results: str                    # path to write the result table
     criteria: list = field(default_factory=list)  # criterion ids, in order
+    criteria_weights: dict[str, float] = field(default_factory=dict)
     n_evaluations: int = 4        # repeated verifications K per criterion
     pivots: int = 2                 # number of pivots k in the tournament
     seed: int = 0                   # seed for the random ring pass
@@ -69,6 +70,34 @@ BENCHMARKS = {
         cache="cache/cache_swebench.json",
         results="results/swe_bench.txt",
         # runs: defaults to every run directory found under trajs_dir
+        data={"trajs_dir": "data/swebench_verified_trajs"},
+    ),
+    "swe_bench_logic": Benchmark(
+        name="SWE-BENCH VERIFIED  (logic-risk ablation, x3)",
+        loader="swe",
+        prompts="swe_bench_logic",
+        criteria=[
+            "root_cause",
+            "logic_l1",
+            "logic_l2",
+            "logic_l3",
+            "logic_l4",
+            "logic_l5",
+            "logic_l6",
+            "verification",
+        ],
+        criteria_weights={
+            "root_cause": 1.0,
+            "logic_l1": 1.0 / 6.0,
+            "logic_l2": 1.0 / 6.0,
+            "logic_l3": 1.0 / 6.0,
+            "logic_l4": 1.0 / 6.0,
+            "logic_l5": 1.0 / 6.0,
+            "logic_l6": 1.0 / 6.0,
+            "verification": 1.0,
+        },
+        cache="cache/cache_swebench_logic.json",
+        results="results/swe_bench_logic.txt",
         data={"trajs_dir": "data/swebench_verified_trajs"},
     ),
     "medagentbench": Benchmark(

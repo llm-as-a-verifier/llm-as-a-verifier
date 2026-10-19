@@ -21,7 +21,10 @@ import math
 import os
 import re
 import threading
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from numbers import Real
+from typing import Optional
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 # DeepSeek's rolling alias endpoint: currently serves DeepSeek V4.1 Flash.
@@ -781,20 +784,69 @@ def cache_key(crit_id, task_name, a, b, rep):
     return f"{crit_id}|{task_name}|{a},{b}|{rep}"
 
 
-def directed_reward(scores, task_name, a, b, criteria_ids, n_reps):
+def normalize_criterion_weights(
+        criteria_ids: Sequence[str],
+        criterion_weights: Optional[Mapping[str, object]],
+) -> Optional[dict[str, float]]:
+    """Validate optional weights against the selected criterion ids."""
+    if criterion_weights is None:
+        return None
+
+    selected = set(criteria_ids)
+    provided = set(criterion_weights)
+    missing = sorted(selected - provided)
+    unknown = sorted(provided - selected, key=str)
+    if missing or unknown:
+        raise ValueError(
+            "criterion_weights must match selected criteria exactly; "
+            f"missing={missing}, unknown={unknown}")
+
+    normalized = {}
+    for cid in criteria_ids:
+        weight = criterion_weights[cid]
+        if (isinstance(weight, bool) or not isinstance(weight, Real)
+                or not math.isfinite(weight) or weight <= 0):
+            raise ValueError(
+                f"criterion_weights[{cid!r}] must be a finite positive "
+                f"number, got {weight!r}")
+        normalized[cid] = float(weight)
+    return normalized
+
+
+def directed_reward(scores, task_name, a, b, criteria_ids, n_reps,
+                    criterion_weights=None):
     """Fine-grained rewards (R_a, R_b) for the directed comparison (a, b),
-    averaged over criteria and repeats. Missing entries default to 0.5."""
+    averaged over criteria and repeats. Missing entries default to 0.5.
+
+    When supplied, ``criterion_weights`` must contain one validated positive
+    weight per criterion id. Omitted weights preserve equal averaging.
+    """
     if a == b:
         return 0.5, 0.5
+
+    if criterion_weights is None:
+        sa = sb = 0.0
+        cnt = 0
+        for cid in criteria_ids:
+            for rep in range(n_reps):
+                entry = scores.get(cache_key(cid, task_name, a, b, rep), {})
+                sa += entry.get("score_A", 0.5)
+                sb += entry.get("score_B", 0.5)
+                cnt += 1
+        return (sa / cnt, sb / cnt) if cnt else (0.5, 0.5)
+
     sa = sb = 0.0
-    cnt = 0
+    total_weight = 0.0
+    weight_exponent = math.frexp(max(criterion_weights.values(), default=1.0))[1]
     for cid in criteria_ids:
+        weight = math.ldexp(criterion_weights[cid], -weight_exponent)
         for rep in range(n_reps):
             entry = scores.get(cache_key(cid, task_name, a, b, rep), {})
-            sa += entry.get("score_A", 0.5)
-            sb += entry.get("score_B", 0.5)
-            cnt += 1
-    return (sa / cnt, sb / cnt) if cnt else (0.5, 0.5)
+            sa += entry.get("score_A", 0.5) * weight
+            sb += entry.get("score_B", 0.5) * weight
+            total_weight += weight
+    return ((sa / total_weight, sb / total_weight)
+            if total_weight else (0.5, 0.5))
 
 
 class LazyClient:

@@ -7,6 +7,7 @@ runs use `scripts/run.py`.
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import sys
@@ -27,6 +28,7 @@ from llm_verifier.fine_grained_reward import (
     directed_reward,
     format_usage,
     load_dotenv,
+    normalize_criterion_weights,
     score_directed_pairs,
     score_pair_criterion,
     token_usage,
@@ -118,6 +120,7 @@ def select(
     candidates: Sequence[str],
     *,
     criteria: CriteriaArg,
+    criterion_weights: Optional[Mapping[str, float]] = None,
     images: Optional[ImagesArg] = None,
     ground_truth_note: Optional[str] = None,
     n_evaluations: int = 4,
@@ -143,6 +146,9 @@ def select(
         criteria: a bundled benchmark name (e.g. ``"swe_bench"``), a path to a
             ``*.md`` criteria file, a ``{name: description}`` dict, or a list
             of strings / ``{"id", "name", "description"}`` dicts.
+        criterion_weights: optional mapping containing one positive weight for
+            every selected criterion id. Weights are relative and need not sum
+            to one; omitted weights preserve equal averaging.
         images: task-context image(s) the verifier sees with every comparison
             — one image or a list; each a file path, http(s) URL, or raw
             bytes. Requires a multimodal verifier model.
@@ -175,6 +181,8 @@ def select(
     """
     note, crits = _resolve_criteria(criteria, ground_truth_note)
     criteria_ids = [c["id"] for c in crits]
+    resolved_weights = normalize_criterion_weights(
+        criteria_ids, criterion_weights)
     show_progress = _default_progress(progress)
     if max_workers is None:
         max_workers = default_max_workers()
@@ -201,7 +209,8 @@ def select(
 
     def directed_for(scores):
         return lambda a, b: directed_reward(
-            scores, task, a, b, criteria_ids, n_evaluations)
+            scores, task, a, b, criteria_ids, n_evaluations,
+            resolved_weights)
 
     def score_pairs(pairs):
         return score_directed_pairs(
@@ -237,6 +246,7 @@ def compare(
     trace_b: str,
     *,
     criteria: CriteriaArg,
+    criterion_weights: Optional[Mapping[str, float]] = None,
     images: Optional[ImagesArg] = None,
     ground_truth_note: Optional[str] = None,
     n_evaluations: int = 1,
@@ -251,11 +261,15 @@ def compare(
     raw pairwise reward `select` is built on — a single directed call does
     not cancel slot bias the way `select`'s ring pass does. `criteria` and
     `images` accept the same forms as `select`; a failed verifier call
-    raises.
+    raises. ``criterion_weights`` follows the same complete-mapping contract
+    as `select`.
     """
     if n_evaluations < 1:
         raise ValueError("n_evaluations must be >= 1")
     note, crits = _resolve_criteria(criteria, ground_truth_note)
+    criteria_ids = [c["id"] for c in crits]
+    resolved_weights = normalize_criterion_weights(
+        criteria_ids, criterion_weights)
     if max_workers is None:
         max_workers = default_max_workers()
     if client is None:
@@ -274,6 +288,18 @@ def compare(
                     images),
                 jobs))
 
-    r_a = sum(r[0] for r in results) / len(results)
-    r_b = sum(r[1] for r in results) / len(results)
+    if resolved_weights is None:
+        r_a = sum(r[0] for r in results) / len(results)
+        r_b = sum(r[1] for r in results) / len(results)
+    else:
+        weight_exponent = math.frexp(max(resolved_weights.values(), default=1.0))[1]
+        total_weight = sum(
+            math.ldexp(resolved_weights[crit["id"]], -weight_exponent)
+            for crit in jobs)
+        r_a = sum(
+            result[0] * math.ldexp(resolved_weights[crit["id"]], -weight_exponent)
+            for crit, result in zip(jobs, results)) / total_weight
+        r_b = sum(
+            result[1] * math.ldexp(resolved_weights[crit["id"]], -weight_exponent)
+            for crit, result in zip(jobs, results)) / total_weight
     return r_a, r_b

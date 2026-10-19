@@ -19,9 +19,12 @@ expects:
 - `## Criteria`
 - one `### <id> — <Name>` block per criterion
 
-Aim for **2–3 criteria** that are *decidable from the trajectory alone* and that
+Aim for **2–4 criteria** that are *decidable from the trajectory alone* and that
 target this task's common failure modes. The criteria should avoid label leakage 
 or reward hacking: they should evaluate observable behavior in the trajectory.
+If several criteria decompose one broader scoring dimension, pass a complete
+`criterion_weights={"criterion_a": 1.0, "criterion_b": 0.5}` mapping to
+`llm_verifier.select` so that dimension keeps its intended aggregate weight.
 
 ## 3. Write a runner
 

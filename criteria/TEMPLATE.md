@@ -25,6 +25,11 @@ Do NOT trust the agent's self-assessment or claims of success.
      next heading is that criterion's instruction. The verifier scores each
      criterion INDEPENDENTLY, so 2-4 narrow criteria beat one broad one.
 
+     When multiple narrow criteria replace one existing macro criterion, pass
+     `criterion_weights` to `select` / `compare` so the split does not give
+     that macro criterion more influence merely because it has more headings.
+     The mapping must contain every selected criterion id exactly once.
+
      The criterion's id (its score-cache key) is slugged from the name, e.g.
      "Final Answer Correctness" -> "final_answer_correctness". To keep the id
      stable while you reword the name, pin it with a trailing `{#id}`:

@@ -31,6 +31,7 @@ from llm_verifier.fine_grained_reward import (
     directed_reward,
     format_usage,
     load_dotenv,
+    normalize_criterion_weights,
     score_directed_pairs,
 )
 from llm_verifier.loaders import LOADERS
@@ -124,6 +125,8 @@ def run_benchmark(cfg, pivots=None, n_evaluations=None, seed=None,
     note, all_criteria = load_prompts(cfg.prompts)
     criteria = select_criteria(all_criteria, cfg.criteria)
     criteria_ids = [c["id"] for c in criteria]
+    criteria_weights = normalize_criterion_weights(
+        criteria_ids, cfg.criteria_weights or None)
 
     # ---- data ----
     print(f"Loading {cfg.name} ...")
@@ -146,7 +149,8 @@ def run_benchmark(cfg, pivots=None, n_evaluations=None, seed=None,
 
     def score_fn(scores):
         def directed(a, b, t):
-            return directed_reward(scores, t, a, b, criteria_ids, n_reps)
+            return directed_reward(
+                scores, t, a, b, criteria_ids, n_reps, criteria_weights)
         return directed
 
     # ---- step 1: sample one ring per swing task (deterministic given seed) ----
@@ -204,7 +208,8 @@ def run_benchmark(cfg, pivots=None, n_evaluations=None, seed=None,
 
     return dict(
         n_tasks=n_tasks, n_runs=n_runs, n_swing=len(swing),
-        criteria_ids=criteria_ids, n_reps=n_reps, k=k, seed=seed,
+        criteria_ids=criteria_ids, criteria_weights=criteria_weights,
+        n_reps=n_reps, k=k, seed=seed,
         pass1=pass1, verifier=verifier, oracle=oracle, avg_cmp=avg_cmp,
         usage=USAGE - usage_before,  # this call's usage only
         comparisons=total_comparisons, results_file=results_file,
@@ -212,18 +217,22 @@ def run_benchmark(cfg, pivots=None, n_evaluations=None, seed=None,
 
 
 def report(cfg, n_tasks, n_runs, n_swing, criteria_ids, n_reps, k, seed,
-           pass1, verifier, oracle, avg_cmp, usage=USAGE, comparisons=None,
-           results_file=None):
+           pass1, verifier, oracle, avg_cmp, criteria_weights=None,
+           usage=USAGE, comparisons=None, results_file=None):
     def pct(x):
         # An empty dataset reports "no tasks", it does not crash the run.
         return f"{100 * x / n_tasks:>6.1f}%" if n_tasks else f"{'--':>7s}"
+
+    criteria_config = f"  g{GRANULARITY}  criteria={criteria_ids}  K={n_reps}  " \
+                      f"pivots={k}  seed={seed}"
+    if criteria_weights:
+        criteria_config += f"  weights={criteria_weights}"
 
     lines = [
         "",
         "=" * 72,
         cfg.name,
-        f"  g{GRANULARITY}  criteria={criteria_ids}  K={n_reps}  "
-        f"pivots={k}  seed={seed}",
+        criteria_config,
         f"  tasks={n_tasks}  swing={n_swing}  N(trials)={n_runs}  "
         f"comparisons/task={avg_cmp:.1f}",
         "=" * 72,

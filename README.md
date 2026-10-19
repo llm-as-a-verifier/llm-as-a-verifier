@@ -99,6 +99,41 @@ reward_a, reward_b = llm_verifier.compare(
 print(reward_a, reward_b)   # fine-grained rewards in [0, 1]: 0.99994 0
 ```
 
+### Weight decomposed criteria
+
+Criteria are equally weighted by default. When several focused criteria
+replace one broader criterion, pass one positive weight for every selected
+criterion id so the decomposition does not silently change the scoring goal:
+
+```python
+criteria = [
+    {"id": "root", "name": "Root cause",
+     "description": "Did the patch fix the code path causing the bug?"},
+    {"id": "logic_l1", "name": "L1",
+     "description": "Do changed names resolve to the intended definitions?"},
+    {"id": "logic_l2", "name": "L2",
+     "description": "Do changed values satisfy their type contracts?"},
+    {"id": "verification", "name": "Verification",
+     "description": "Did observed command output prove the fix?"},
+]
+
+result = llm_verifier.select(
+    problem,
+    candidates,
+    criteria=criteria,
+    criterion_weights={
+        "root": 1.0,
+        "logic_l1": 0.5,
+        "logic_l2": 0.5,
+        "verification": 1.0,
+    },
+)
+```
+
+Weights are relative and need not sum to one. A supplied mapping must contain
+every selected criterion id exactly once. `compare` accepts the same
+`criterion_weights` argument.
+
 ### Fine-grained Progress Tracking
 
 The same fine-grained reward can also score an agent's progress after each
@@ -186,8 +221,14 @@ Run a benchmark by name (`python scripts/run.py` with no argument lists them):
 ```bash
 python scripts/run.py terminal_bench
 python scripts/run.py swe_bench
+python scripts/run.py swe_bench_logic
 python scripts/run.py medagentbench
 ```
+
+`swe_bench_logic` is the Issue #1 ablation: it replaces the broad code-review
+criterion with six focused logic-risk criteria while keeping root cause, logic,
+and verification at equal macro weight. It uses
+`cache/cache_swebench_logic.json`, separate from the baseline cache.
 
 The tournament defaults can be overridden on the command line:
 
@@ -383,6 +424,10 @@ R(x, \tau)
 = \frac{1}{CK} \sum_{c=1}^{C} \sum_{k=1}^{K}
 \sum_{g=1}^{G} p_{\theta}(v_g \mid x, c, \tau)\,\phi(v_g)
 $$
+
+This equation shows the default equal-weight case. With
+`criterion_weights`, the outer `1/C` average is replaced by the normalized
+positive weight assigned to each criterion.
 
 - $C$ = number of evaluation criteria
 - $K$ = number of repeated verifications
