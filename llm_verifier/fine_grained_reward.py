@@ -16,6 +16,7 @@ any OpenAI-compatible server with logprobs), the score expectation
 """
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -781,6 +782,70 @@ def cache_key(crit_id, task_name, a, b, rep):
     return f"{crit_id}|{task_name}|{a},{b}|{rep}"
 
 
+# ---------------------------------------------------------------------------
+# Content fingerprint. `cache_key` names a comparison by position —
+# criterion, task name and candidate indices — which says nothing about what
+# was scored. Two `select()` calls share the synthetic task name "task", so
+# one cache file reused across them would replay the first call's scores for
+# the second: no API calls, wrong numbers, no error. Benchmarks hit the same
+# hazard whenever trajectories are regenerated under stable task names, or
+# the verifier model changes.
+#
+# So the on-disk key carries a fingerprint of everything the verifier saw for
+# that comparison — exactly the non-client arguments of
+# `score_pair_criterion`. Entries whose content no longer matches simply miss
+# and are re-scored; an entry is never reused for content it was not
+# produced from.
+# ---------------------------------------------------------------------------
+
+def _digest(text, memo=None):
+    """SHA-256 of one text field, memoized per call — traces are large and a
+    single run fingerprints each one many times."""
+    if memo is None:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    digest = memo.get(text)
+    if digest is None:
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        memo[text] = digest
+    return digest
+
+
+def _images_digest(images, memo=None):
+    """Fingerprint the image bytes actually sent to the verifier."""
+    parts = []
+    for image in as_image_list(images):
+        data, _ = load_image(image)
+        digest = memo.get(data) if memo is not None else None
+        if digest is None:
+            digest = hashlib.sha256(data).hexdigest()
+            if memo is not None:
+                memo[data] = digest
+        parts.append(digest)
+    return "\x1f".join(parts)
+
+
+def pair_fingerprint(problem, trace_a, trace_b, crit, ground_truth_note,
+                     model, images=None, memo=None):
+    """Short fingerprint of the inputs that determine one comparison's
+    prompt and the model answering it."""
+    fields = [
+        _digest(problem or "", memo),
+        _digest(trace_a or "", memo),
+        _digest(trace_b or "", memo),
+        _digest(crit.get("name", "") or "", memo),
+        _digest(crit.get("description", "") or "", memo),
+        _digest(ground_truth_note or "", memo),
+        _digest(model or "", memo),
+        _images_digest(images, memo),
+    ]
+    return hashlib.sha256("\x1f".join(fields).encode("utf-8")).hexdigest()[:16]
+
+
+def disk_cache_key(key, fingerprint):
+    """The persisted form of `key`: position plus content fingerprint."""
+    return f"{key}|{fingerprint}"
+
+
 def directed_reward(scores, task_name, a, b, criteria_ids, n_reps):
     """Fine-grained rewards (R_a, R_b) for the directed comparison (a, b),
     averaged over criteria and repeats. Missing entries default to 0.5."""
@@ -831,23 +896,87 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
 
     `on_error`: ``"tie"`` scores a failed call 0.5/0.5 for this run only
     (failures are never written to the cache), ``"raise"`` re-raises the
-    first failure. Returns the merged scores dict."""
+    first failure. Returns the merged scores dict.
+
+    Cache entries are bound to their content (see `pair_fingerprint`): an
+    entry is reused only when the problem, both traces, the criterion text,
+    the ground-truth note, the model and the images all match the comparison
+    being scored. Entries for content that has since changed — and entries
+    written before content binding — are left untouched on disk and
+    re-scored."""
     if on_error not in ("tie", "raise"):
         raise ValueError(f"on_error must be 'tie' or 'raise', got {on_error!r}")
 
-    cached = {}
+    disk = {}
     if cache_file and os.path.exists(cache_file):
         with open(cache_file) as f:
-            cached = json.load(f)
+            disk = json.load(f)
 
+    digests = {}
+    image_inputs = {}
+
+    def images_for(trial):
+        # Pin mutable paths/URLs once, so the fingerprint and scorer see the
+        # same bytes without changing the caller's task records.
+        key = id(trial)
+        if key not in image_inputs:
+            image_inputs[key] = [
+                load_image(image)[0]
+                for image in as_image_list(trial.get("images"))
+            ]
+        return image_inputs[key]
+
+    def fingerprint(trials, a, b, crit):
+        return pair_fingerprint(
+            trials[a]["problem"], trials[a]["trace"], trials[b]["trace"],
+            crit, ground_truth_note, model, images_for(trials[a]), digests)
+
+    # Disk keys carry the fingerprint; `directed_reward` looks entries up by
+    # position. Translate the entries whose content matches what this call is
+    # scoring — including pairs outside `needed_pairs`, since a later phase
+    # aggregates over the pairs an earlier one scored.
+    results = {}
+    if disk:  # nothing on disk, nothing to translate
+        for task_name, trials in tasks.items():
+            for a in range(len(trials)):
+                for b in range(len(trials)):
+                    if a == b:
+                        continue
+                    for crit in criteria:
+                        try:
+                            fp = fingerprint(trials, a, b, crit)
+                        except Exception:
+                            # Never replay unverifiable entries; requested
+                            # comparisons apply the error policy below.
+                            continue
+                        for rep in range(n_reps):
+                            key = cache_key(crit["id"], task_name, a, b, rep)
+                            entry = disk.get(disk_cache_key(key, fp))
+                            if entry is not None:
+                                results[key] = entry
+
+    log = print if progress else (lambda *a, **kw: None)
+    errors = 0
     jobs = []
     for task_name, pairs in needed_pairs.items():
         trials = tasks[task_name]
         for a, b in pairs:
             for crit in criteria:
+                try:
+                    fp = fingerprint(trials, a, b, crit)
+                except Exception as e:
+                    if on_error == "raise":
+                        raise
+                    for rep in range(n_reps):
+                        key = cache_key(crit["id"], task_name, a, b, rep)
+                        results[key] = {"score_A": 0.5, "score_B": 0.5}
+                    errors += n_reps
+                    if errors <= 3:
+                        log(f"\n  Error: {e}")
+                    continue
                 for rep in range(n_reps):
                     key = cache_key(crit["id"], task_name, a, b, rep)
-                    if key not in cached:
+                    if key not in results:
                         swap = rep % 2 == 1
                         ta, tb = trials[a]["trace"], trials[b]["trace"]
                         if swap:
@@ -856,36 +985,37 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                         # a prefix.
                         sa, sb = (b, a) if swap else (a, b)
                         prefix = (task_name, sa, sb)
-                        jobs.append((key, trials[a]["problem"], ta, tb,
-                                     crit, trials[a].get("images"), swap,
+                        jobs.append((key, disk_cache_key(key, fp),
+                                     trials[a]["problem"], ta, tb,
+                                     crit, images_for(trials[a]), swap,
                                      prefix))
 
-    log = print if progress else (lambda *a, **kw: None)
-
     if not jobs:
-        log(f"  All scores cached ({len(cached)} entries)")
-        return cached
+        if errors:
+            log(f"  Done ({errors} errors)")
+        else:
+            log(f"  All scores cached ({len(results)} entries)")
+        return results
 
     # Warm-up wave: one job per distinct prompt prefix, then the rest.
     seen = set()
     warm, rest = [], []
     for job in jobs:
-        prefix = job[7]
+        prefix = job[8]
         if prefix in seen:
             rest.append(job)
         else:
             seen.add(prefix)
             warm.append(job)
 
-    log(f"  {len(jobs)} scoring jobs ({len(cached)} cached); "
+    log(f"  {len(jobs)} scoring jobs ({len(results)} available entries); "
         f"warming {len(warm)} prefixes")
 
     client = lazy_client.get()
     usage_before = USAGE.copy()
-    # `results` is what this run sees; `cached` is what gets persisted
-    # (error ties go into `results` only).
-    results = dict(cached)
-    errors = 0
+    # `results` is what this run sees, keyed by position; `disk` is what gets
+    # persisted, keyed by position and content (error ties go into `results`
+    # only).
     done = 0
     save_every = max(1, len(jobs) // 20)
 
@@ -905,17 +1035,17 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
             futures = {
                 executor.submit(score_pair_criterion, client, prob, ta, tb,
                                 crit, ground_truth_note, model, images):
-                    (key, swap)
-                for key, prob, ta, tb, crit, images, swap, _ in phase_jobs
+                    (key, dk, swap)
+                for key, dk, prob, ta, tb, crit, images, swap, _ in phase_jobs
             }
             for future in as_completed(futures):
-                key, swap = futures[future]
+                key, dk, swap = futures[future]
                 try:
                     ra, rb = future.result()
                     if swap:  # scores back in candidate order
                         ra, rb = rb, ra
                     entry = {"score_A": ra, "score_B": rb}
-                    cached[key] = entry
+                    disk[dk] = entry
                     results[key] = entry
                 except Exception as e:
                     if on_error == "raise":
@@ -932,7 +1062,7 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                     pbar.set_postfix(errors=errors)
                 if cache_file and done % save_every == 0:
                     with open(cache_file, "w") as f:
-                        json.dump(cached, f)
+                        json.dump(disk, f)
 
     run_phase(warm)
     run_phase(rest)
@@ -941,7 +1071,7 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
 
     if cache_file:
         with open(cache_file, "w") as f:
-            json.dump(cached, f)
+            json.dump(disk, f)
 
     log(f"  Done ({errors} errors)")
     log(f"  Tokens: {USAGE - usage_before}")

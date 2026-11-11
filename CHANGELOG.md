@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Bind cached image comparisons to the loaded image bytes rather than a
+  mutable file path or URL, and score the same snapshot used for the key.
+- Preserve `on_error` handling for image-loading failures during cache
+  preparation; failed comparisons remain uncached ties or raise on request.
+
 ## 0.3.0 — 2026-10-08
 
 - **Terminal-Bench 4.0 benchmark.** New `terminal_bench_4.0` benchmark: 330
