@@ -943,19 +943,37 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                     if a == b:
                         continue
                     for crit in criteria:
-                        fp = fingerprint(trials, a, b, crit)
+                        try:
+                            fp = fingerprint(trials, a, b, crit)
+                        except Exception:
+                            # Never replay unverifiable entries; requested
+                            # comparisons apply the error policy below.
+                            continue
                         for rep in range(n_reps):
                             key = cache_key(crit["id"], task_name, a, b, rep)
                             entry = disk.get(disk_cache_key(key, fp))
                             if entry is not None:
                                 results[key] = entry
 
+    log = print if progress else (lambda *a, **kw: None)
+    errors = 0
     jobs = []
     for task_name, pairs in needed_pairs.items():
         trials = tasks[task_name]
         for a, b in pairs:
             for crit in criteria:
-                fp = fingerprint(trials, a, b, crit)
+                try:
+                    fp = fingerprint(trials, a, b, crit)
+                except Exception as e:
+                    if on_error == "raise":
+                        raise
+                    for rep in range(n_reps):
+                        key = cache_key(crit["id"], task_name, a, b, rep)
+                        results[key] = {"score_A": 0.5, "score_B": 0.5}
+                    errors += n_reps
+                    if errors <= 3:
+                        log(f"\n  Error: {e}")
+                    continue
                 for rep in range(n_reps):
                     key = cache_key(crit["id"], task_name, a, b, rep)
                     if key not in results:
@@ -972,10 +990,11 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
                                      crit, images_for(trials[a]), swap,
                                      prefix))
 
-    log = print if progress else (lambda *a, **kw: None)
-
     if not jobs:
-        log(f"  All scores cached ({len(results)} entries)")
+        if errors:
+            log(f"  Done ({errors} errors)")
+        else:
+            log(f"  All scores cached ({len(results)} entries)")
         return results
 
     # Warm-up wave: one job per distinct prompt prefix, then the rest.
@@ -989,7 +1008,7 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
             seen.add(prefix)
             warm.append(job)
 
-    log(f"  {len(jobs)} scoring jobs ({len(results)} cached); "
+    log(f"  {len(jobs)} scoring jobs ({len(results)} available entries); "
         f"warming {len(warm)} prefixes")
 
     client = lazy_client.get()
@@ -997,7 +1016,6 @@ def score_directed_pairs(lazy_client, tasks, needed_pairs, criteria,
     # `results` is what this run sees, keyed by position; `disk` is what gets
     # persisted, keyed by position and content (error ties go into `results`
     # only).
-    errors = 0
     done = 0
     save_every = max(1, len(jobs) // 20)
 

@@ -183,3 +183,72 @@ def test_scoring_uses_the_same_image_snapshot_as_the_fingerprint(
     _score(tmp_path, tasks)
     assert seen == [b"first image"]
     assert tasks["task"][0]["images"] == image
+
+
+@pytest.mark.parametrize("use_cache", [False, True])
+@pytest.mark.parametrize("on_error", ["tie", "raise"])
+def test_image_preparation_respects_error_policy(
+        tmp_path, monkeypatch, use_cache, on_error):
+    tasks = _tasks("synthetic image failure", ["aa", "bbb"])
+    tasks["task"][0]["images"] = tmp_path / "missing.png"
+    cache = tmp_path / "cache.json"
+    existing = {"unrelated": {"score_A": 0.8, "score_B": 0.2}}
+    if use_cache:
+        cache.write_text(json.dumps(existing))
+    lazy = fgr.LazyClient()
+    monkeypatch.setattr(lazy, "get", lambda: pytest.fail(
+        "image preparation must not construct a provider client"))
+
+    def score():
+        return fgr.score_directed_pairs(
+            lazy, tasks, {"task": [(0, 1)]}, [CRITERION], NOTE,
+            n_reps=2, max_workers=1,
+            cache_file=str(cache) if use_cache else None,
+            progress=False, on_error=on_error)
+
+    if on_error == "raise":
+        with pytest.raises(FileNotFoundError):
+            score()
+    else:
+        results = score()
+        assert results == {
+            fgr.cache_key("correctness", "task", 0, 1, rep):
+                {"score_A": 0.5, "score_B": 0.5}
+            for rep in range(2)
+        }
+    if use_cache:
+        assert json.loads(cache.read_text()) == existing
+    else:
+        assert not cache.exists()
+
+
+def test_image_preparation_failure_does_not_skip_valid_comparisons(
+        tmp_path, scorer):
+    tasks = _tasks("synthetic mixed comparisons", ["aa", "bbb", "cccc"])
+    tasks["task"][0]["images"] = tmp_path / "missing.png"
+    lazy = fgr.LazyClient()
+    lazy._client = object()
+    cache = tmp_path / "cache.json"
+    results = fgr.score_directed_pairs(
+        lazy, tasks, {"task": [(0, 1), (1, 2)]}, [CRITERION], NOTE,
+        n_reps=1, max_workers=1, cache_file=str(cache),
+        progress=False, on_error="tie")
+
+    failed = fgr.cache_key("correctness", "task", 0, 1, 0)
+    valid = fgr.cache_key("correctness", "task", 1, 2, 0)
+    assert results[failed] == {"score_A": 0.5, "score_B": 0.5}
+    assert results[valid] == {"score_A": 3.0, "score_B": 4.0}
+    assert len(scorer) == 1
+    disk = json.loads(cache.read_text())
+    assert len(disk) == 1
+    assert next(iter(disk)).startswith(valid + "|")
+
+
+def test_unrequested_image_failure_does_not_abort_cache_translation(
+        tmp_path, scorer):
+    tasks = _tasks("synthetic unrelated image", ["aa", "bbb", "cccc"])
+    tasks["task"][2]["images"] = tmp_path / "missing.png"
+    first = _score(tmp_path, tasks)
+    second = _score(tmp_path, tasks)
+    assert first == second
+    assert len(scorer) == 1
